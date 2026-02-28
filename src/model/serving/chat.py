@@ -210,6 +210,48 @@ def _extract_base64_file(tool_response: str, data_path: str) -> str:
     return json.dumps(data)
 
 
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+
+
+def _maybe_inject_image(tool_response: str, messages: list, chat_ui=None, verbose=False):
+    """If a tool returned an image file path, inject it into the message list.
+
+    VLMs (like Qwen-VL) need the actual image pixels in the conversation.
+    When an MCP tool returns an ImageContent, the ToolHandler saves it to a
+    temp file and returns the path.  This function detects that pattern and
+    appends a user message with the base64-encoded image so the VLM can
+    analyse it on the next iteration.
+    """
+    if not tool_response:
+        return
+    path = tool_response.strip()
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _IMAGE_EXTENSIONS:
+        return
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        mime = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
+        }.get(ext, "image/png")
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "The tool returned this image. Describe what you see in detail:"},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            ],
+        })
+        if chat_ui:
+            chat_ui.add_log(f"Injected image ({ext}) into VLM context", level="info")
+        elif verbose:
+            logger.info("Injected tool-returned image into VLM context: %s", path)
+    except Exception as e:
+        logger.warning("Failed to inject image from %s: %s", path, e)
+
+
 async def chat(host: str = "http://127.0.0.1:8001/v1",
          host_key: str = "EMPTY",
          model: str = "Qwen/Qwen3-8B",
@@ -401,6 +443,8 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                                 tool_response = _extract_base64_file(tool_response, data_path)
                             tool_message = {'role': 'tool', 'content': tool_response, 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
                             messages.append(tool_message)
+                            # Inject image into VLM context if tool returned an image file
+                            _maybe_inject_image(tool_response, messages, chat_ui=chat_ui, verbose=verbose)
                             truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
                             if chat_ui:
                                 chat_ui.add_log(f"{function_name}({function_arguments}) returned: {truncated}", level="debug")
@@ -481,6 +525,8 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                             tool_response = _extract_base64_file(tool_response, data_path)
                         tool_message = {'role': 'tool', 'content': tool_response, 'name': tool.function.name, 'parameters': function_arguments, "tool_call_id": tool.id,}
                         messages.append(tool_message)
+                        # Inject image into VLM context if tool returned an image file
+                        _maybe_inject_image(tool_response, messages, chat_ui=chat_ui, verbose=verbose)
 
                         # Log tool response (truncated for display)
                         truncated_response = tool_response[:200] + "..." if len(tool_response) > 200 else tool_response

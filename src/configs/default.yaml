@@ -1,18 +1,20 @@
 serving:
   # Set via env var ONIT_HOST or --host CLI flag
-  # host: http://localhost:8000/v1
+  host: http://202.92.159.240:8001/v1
   # host_key: EMPTY  # API key. For OpenRouter set here or via OPENROUTER_API_KEY env var
-  model: Qwen/Qwen3-30B-A3B-Instruct-2507
-  think: false
-  max_tokens: 8192
+  model: Qwen/Qwen3.5-35B-A3B
+  think: true
+  # max_tokens: 8192
+  max_tokens: 80192
 
 messages:
   safety_warning:  "Press 'Enter' key to stop all tasks."
 
-verbose: false
-show_logs: false
+verbose: true
+show_logs: true
 
 theme: dark
+persona: "assistant"
 session_path: "~/.onit/sessions"
 
 # see template examples in the `src/mcp/prompts/prompt_templates` folder
@@ -39,16 +41,16 @@ web_port: 9000
 # 7. Copy BOTH the Client ID and Client Secret
 #
 # NOTE: Keep your credentials secure and do not commit them to version control!
-web_google_client_id:
-web_google_client_secret:
+# web_google_client_id: 
+# web_google_client_secret: 
 
 # Optional: Restrict access to specific email addresses or domains
 # If not specified, any verified Google account can access the web UI
 # Supports:
 #   - Exact emails: "user1@allusers.com" allows specific email addresses
 #   - Domain wildcards: "*@example.com" allows any email from example.com domain
-# web_allowed_emails:
-#     - "*@example.com"
+web_allowed_emails:
+    - "*@gmail.com"
 #     - "user1@allusers.com"
 
 mcp:
@@ -65,3 +67,4 @@ mcp:
       description: Web search, bash commands, file operations, and document tools
       url: http://127.0.0.1:18201/sse
       enabled: true
+

@@ -1,0 +1,41 @@
+# TurtleBot3 Agent Configuration
+#
+# Usage:
+#   source /opt/ros/humble/setup.bash
+#   onit --a2a --config src/configs/turtlebot3.yaml
+#
+# Then from another terminal:
+#   onit --a2a-client --a2a-task "move forward"
+#   onit --a2a-client --a2a-task "tell me what you see"
+
+serving:
+  host: http://202.92.159.240:8001/v1
+  model: Qwen/Qwen3.5-35B-A3B
+  think: true
+  max_tokens: 80192
+
+verbose: true
+show_logs: true
+
+theme: dark
+persona: "turtlebot3"
+session_path: "~/.onit/sessions"
+
+template_path: src/mcp/prompts/prompt_templates/assistant_robotics.yaml
+
+# Timeout per tool call (seconds). Motion commands may take a while.
+timeout: 60
+
+mcp:
+  # Tell _ensure_mcp_servers() which runner config to use
+  runner_config: src/mcp/servers/configs/turtlebot3.yaml
+  servers:
+    - name: PromptsMCPServer
+      description: Provides prompt templates for instruction generation
+      url: http://127.0.0.1:18200/sse
+      enabled: true
+
+    - name: TurtleBot3MCPServer
+      description: TurtleBot3 sensor and motion tools via ROS 2
+      url: http://127.0.0.1:18202/sse
+      enabled: true

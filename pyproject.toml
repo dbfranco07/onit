@@ -56,6 +56,11 @@ test = [
     "pytest-asyncio",
     "pytest-cov",
 ]
+robotics = [
+    # rclpy, sensor_msgs, nav_msgs, geometry_msgs come from the
+    # ROS 2 workspace (source /opt/ros/humble/setup.bash).
+    # They are not pip-installable — this extra is a marker only.
+]
 all = [
     "onit[web]",
     "onit[gateway]",
