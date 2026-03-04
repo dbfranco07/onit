@@ -41,3 +41,6 @@ htmlcov/
 # Scripts
 scripts/
 *example.yaml
+
+# Configurations
+src/configs/default.yaml
