@@ -127,7 +127,15 @@ class ToolHandler(RequestHandler):
             # MCP data types: https://github.com/modelcontextprotocol/python-sdk/blob/main/src/mcp/types.py
             if isinstance(item, ImageContent):
                 image_data = base64.b64decode(item.data)
-                unique_filename = f"{uuid.uuid4()}.png"
+                # Use the MIME type from MCP to pick the correct file extension
+                # so that _maybe_inject_image sends the right Content-Type.
+                _mime_to_ext = {
+                    "image/jpeg": ".jpg", "image/png": ".png",
+                    "image/gif": ".gif", "image/bmp": ".bmp",
+                    "image/webp": ".webp",
+                }
+                ext = _mime_to_ext.get(getattr(item, 'mimeType', ''), '.jpg')
+                unique_filename = f"{uuid.uuid4()}{ext}"
                 default_image = os.path.join(tempfile.gettempdir(), unique_filename)
                 with open(default_image, "wb") as f:
                     f.write(image_data)

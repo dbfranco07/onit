@@ -22,6 +22,7 @@ import logging
 import webbrowser
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from io import BytesIO
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,138 @@ DEFAULT_VIEWER_PORT = 18280
 # MJPEG Camera Viewer — streams live camera feed to the browser
 # -----------------------------------------------------------------------
 
+_MOSAIC_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>TurtleBot3 Panoramic Mosaic</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #111; color: #ddd;
+      font-family: system-ui, -apple-system, sans-serif;
+      display: flex; flex-direction: column;
+      align-items: center; min-height: 100vh; padding: 12px;
+    }
+    .header {
+      display: flex; align-items: center; gap: 12px;
+      margin-bottom: 8px; flex-wrap: wrap;
+      justify-content: center;
+    }
+    h1 { font-size: 1.2em; color: #fff; white-space: nowrap; }
+    .stats {
+      font-size: 0.85em; color: #aaa;
+      display: flex; gap: 16px;
+    }
+    .stats span { white-space: nowrap; }
+    nav { margin-bottom: 10px; }
+    nav a {
+      color: #7cb3ff; text-decoration: none;
+      padding: 6px 14px; border: 1px solid #555;
+      background: #222; border-radius: 4px;
+      font-size: 0.85em;
+    }
+    nav a:hover { background: #333; border-color: #888; }
+    .controls {
+      display: flex; gap: 8px; margin-bottom: 10px;
+    }
+    .controls button {
+      padding: 6px 14px; border: 1px solid #555;
+      background: #222; color: #ddd; border-radius: 4px;
+      cursor: pointer; font-size: 0.85em;
+    }
+    .controls button:hover { background: #333; border-color: #888; }
+    .feed-container {
+      position: relative;
+      width: 100%; max-width: 1400px;
+      display: flex; justify-content: center;
+    }
+    #mosaic {
+      width: 100%; max-height: 85vh;
+      object-fit: contain;
+      border: 2px solid #333; border-radius: 6px;
+      background: #000;
+    }
+    .placeholder {
+      color: #666; font-size: 1.1em;
+      text-align: center; padding: 60px 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>&#x1F5BC; Panoramic Mosaic</h1>
+    <div class="stats">
+      <span id="status">Waiting for scan&hellip;</span>
+      <span id="ts"></span>
+    </div>
+  </div>
+  <nav><a href="/">&#127909; Live Camera</a></nav>
+  <div class="controls">
+    <button onclick="refresh()" title="Refresh mosaic (R)">&#x1F504; Refresh</button>
+    <button onclick="toggleAuto()" id="autoBtn" title="Toggle auto-refresh (A)">&#x23F1; Auto: ON (3s)</button>
+    <button onclick="download()" title="Download mosaic (D)">&#x1F4BE; Download</button>
+  </div>
+  <div class="feed-container">
+    <div id="placeholderBox" class="placeholder">No frames captured yet. The mosaic builds progressively as the robot searches.</div>
+    <img id="mosaic" style="display:none" alt="Panoramic Mosaic" />
+  </div>
+  <script>
+    var img = document.getElementById('mosaic');
+    var ph  = document.getElementById('placeholderBox');
+    var st  = document.getElementById('status');
+    var tsEl = document.getElementById('ts');
+    var autoOn = true, timer = null;
+
+    function refresh() {
+      fetch('/mosaic?' + Date.now()).then(function(r) {
+        if (r.ok) {
+          var stamp = r.headers.get('X-Mosaic-Stamp') || '';
+          return r.blob().then(function(b) { return { blob: b, stamp: stamp }; });
+        }
+        throw new Error(r.status);
+      }).then(function(result) {
+        img.src = URL.createObjectURL(result.blob);
+        img.style.display = 'block';
+        ph.style.display = 'none';
+        st.textContent = 'Available';
+        if (result.stamp) tsEl.textContent = result.stamp;
+      }).catch(function() {
+        st.textContent = 'No mosaic yet';
+      });
+    }
+
+    function toggleAuto() {
+      autoOn = !autoOn;
+      document.getElementById('autoBtn').textContent =
+        autoOn ? '\\u23F1 Auto: ON (3s)' : '\\u23F1 Auto: OFF';
+      if (autoOn) startTimer(); else stopTimer();
+    }
+    function startTimer() { stopTimer(); timer = setInterval(refresh, 3000); }
+    function stopTimer() { if (timer) { clearInterval(timer); timer = null; } }
+
+    function download() {
+      if (img.src) {
+        var a = document.createElement('a');
+        a.href = '/mosaic'; a.download = 'mosaic_' + Date.now() + '.jpg';
+        a.click();
+      }
+    }
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'r' || e.key === 'R') refresh();
+      if (e.key === 'a' || e.key === 'A') toggleAuto();
+      if (e.key === 'd' || e.key === 'D') download();
+    });
+
+    refresh();
+    startTimer();
+  </script>
+</body>
+</html>
+"""
+
 _VIEWER_HTML = """
 <!DOCTYPE html>
 <html>
@@ -64,57 +197,65 @@ _VIEWER_HTML = """
   <title>TurtleBot3 Camera Viewer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
       background: #111; color: #ddd;
       font-family: system-ui, -apple-system, sans-serif;
       display: flex; flex-direction: column;
       align-items: center; justify-content: center;
       min-height: 100vh; padding: 12px;
-    }}
-    .header {{
+    }
+    .header {
       display: flex; align-items: center; gap: 12px;
       margin-bottom: 8px; flex-wrap: wrap;
       justify-content: center;
-    }}
-    h1 {{ font-size: 1.2em; color: #fff; white-space: nowrap; }}
-    .stats {{
+    }
+    h1 { font-size: 1.2em; color: #fff; white-space: nowrap; }
+    .stats {
       font-size: 0.85em; color: #aaa;
       display: flex; gap: 16px;
-    }}
-    .stats span {{ white-space: nowrap; }}
-    .controls {{
+    }
+    .stats span { white-space: nowrap; }
+    nav { margin-bottom: 10px; }
+    nav a {
+      color: #7cb3ff; text-decoration: none;
+      padding: 6px 14px; border: 1px solid #555;
+      background: #222; border-radius: 4px;
+      font-size: 0.85em;
+    }
+    nav a:hover { background: #333; border-color: #888; }
+    .controls {
       display: flex; gap: 8px; margin-bottom: 10px;
-    }}
-    .controls button {{
+    }
+    .controls button {
       padding: 6px 14px; border: 1px solid #555;
       background: #222; color: #ddd; border-radius: 4px;
       cursor: pointer; font-size: 0.85em;
-    }}
-    .controls button:hover {{ background: #333; border-color: #888; }}
-    .feed-container {{
+    }
+    .controls button:hover { background: #333; border-color: #888; }
+    .feed-container {
       position: relative;
       width: 100%; max-width: 960px;
       display: flex; justify-content: center;
-    }}
-    #cam {{
+    }
+    #cam {
       width: 100%; max-height: 80vh;
       object-fit: contain;
       border: 2px solid #333; border-radius: 6px;
       image-rendering: auto;
       background: #000;
-    }}
-    .live-dot {{
+    }
+    .live-dot {
       width: 8px; height: 8px; border-radius: 50%;
       background: #555; display: inline-block;
-    }}
-    .live-dot.active {{ background: #4caf50; animation: pulse 1.5s infinite; }}
-    @keyframes pulse {{
-      0%, 100% {{ opacity: 1; }}
-      50% {{ opacity: 0.4; }}
-    }}
-    .fullscreen .feed-container {{ max-width: none; }}
-    .fullscreen #cam {{ max-height: 100vh; border: none; border-radius: 0; }}
+    }
+    .live-dot.active { background: #4caf50; animation: pulse 1.5s infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .fullscreen .feed-container { max-width: none; }
+    .fullscreen #cam { max-height: 100vh; border: none; border-radius: 0; }
   </style>
 </head>
 <body>
@@ -126,6 +267,7 @@ _VIEWER_HTML = """
       <span id="res"></span>
     </div>
   </div>
+  <nav><a href="/mosaic.html">&#x1F5BC; Panoramic Mosaic</a></nav>
   <div class="controls">
     <button onclick="takeSnapshot()" title="Save current frame (S)">&#128247; Snapshot</button>
     <button onclick="toggleFullscreen()" title="Toggle fullscreen (F)">&#x26F6; Fullscreen</button>
@@ -134,52 +276,62 @@ _VIEWER_HTML = """
     <img id="cam" src="/stream" alt="Camera feed" />
   </div>
   <script>
-    const img = document.getElementById('cam');
-    const st  = document.getElementById('status');
-    const fpsSp = document.getElementById('fps');
-    const resSp = document.getElementById('res');
-    const dot = document.getElementById('liveDot');
-    let frames = 0, lastTime = performance.now(), fpsVal = 0;
+    var img = document.getElementById('cam');
+    var st  = document.getElementById('status');
+    var fpsSp = document.getElementById('fps');
+    var resSp = document.getElementById('res');
+    var dot = document.getElementById('liveDot');
+    var frames = 0, lastTime = performance.now(), fpsVal = 0;
 
-    img.onload = () => {{
+    img.onload = function() {
       frames++;
-      const now = performance.now();
-      const dt = (now - lastTime) / 1000;
-      if (dt >= 1.0) {{
+      var now = performance.now();
+      var dt = (now - lastTime) / 1000;
+      if (dt >= 1.0) {
         fpsVal = Math.round(frames / dt);
         fpsSp.textContent = fpsVal + ' fps';
         frames = 0; lastTime = now;
-      }}
+      }
       st.textContent = 'Live';
       dot.classList.add('active');
-      if (img.naturalWidth) resSp.textContent = img.naturalWidth + '\u00d7' + img.naturalHeight;
-    }};
-    img.onerror = () => {{
-      st.textContent = 'Reconnecting\u2026';
+      if (img.naturalWidth) resSp.textContent = img.naturalWidth + '\\u00d7' + img.naturalHeight;
+    };
+    img.onerror = function() {
+      st.textContent = 'Reconnecting\\u2026';
       dot.classList.remove('active');
-      setTimeout(() => {{ img.src = '/stream?' + Date.now(); }}, 1500);
-    }};
+      setTimeout(function() { img.src = '/stream?' + Date.now(); }, 1500);
+    };
 
-    function takeSnapshot() {{
-      const a = document.createElement('a');
+    function takeSnapshot() {
+      var a = document.createElement('a');
       a.href = '/snapshot'; a.download = 'turtlebot3_' + Date.now() + '.jpg';
       a.click();
-    }}
-    function toggleFullscreen() {{
-      if (!document.fullscreenElement) {{
-        document.body.requestFullscreen().then(() => document.body.classList.add('fullscreen'));
-      }} else {{
-        document.exitFullscreen().then(() => document.body.classList.remove('fullscreen'));
-      }}
-    }}
-    document.addEventListener('keydown', e => {{
+    }
+    function toggleFullscreen() {
+      if (!document.fullscreenElement) {
+        document.body.requestFullscreen().then(function() { document.body.classList.add('fullscreen'); });
+      } else {
+        document.exitFullscreen().then(function() { document.body.classList.remove('fullscreen'); });
+      }
+    }
+    document.addEventListener('keydown', function(e) {
       if (e.key === 'f' || e.key === 'F') toggleFullscreen();
       if (e.key === 's' || e.key === 'S') takeSnapshot();
-    }});
+    });
   </script>
 </body>
 </html>
 """
+
+
+class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """HTTPServer that handles each request in a new thread.
+
+    Required because the MJPEG /stream endpoint keeps the connection
+    open indefinitely, which would block all other routes (like /mosaic)
+    on a single-threaded server.
+    """
+    daemon_threads = True
 
 
 class _MJPEGHandler(BaseHTTPRequestHandler):
@@ -199,6 +351,10 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_mjpeg()
         elif self.path == '/snapshot':
             self._serve_snapshot()
+        elif self.path == '/mosaic.html':
+            self._serve_mosaic_html()
+        elif self.path.startswith('/mosaic'):
+            self._serve_mosaic_image()
         else:
             self.send_error(404)
 
@@ -222,6 +378,33 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'image/jpeg')
         self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_mosaic_html(self):
+        body = _MOSAIC_HTML.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_mosaic_image(self):
+        bridge = self.bridge_ref
+        if bridge is None:
+            self.send_error(503, 'Bridge not ready')
+            return
+        with bridge._mosaic_lock:
+            data = bridge._mosaic_data
+            stamp = bridge._mosaic_stamp
+        if data is None:
+            self.send_error(404, 'No mosaic available yet - search has not started')
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('X-Mosaic-Stamp', str(stamp) if stamp else '')
+        self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         self.wfile.write(data)
 
@@ -350,6 +533,15 @@ class TurtleBot3Bridge:
         self._viewer_server = None
         self._viewer_port = None
         self._viewer_thread = None
+
+        # Latest panoramic mosaic (built progressively from search frames)
+        self._mosaic_lock = threading.Lock()
+        self._mosaic_data = None   # bytes (JPEG)
+        self._mosaic_stamp = None  # datetime
+
+        # Progressive search frame accumulator (fed by get_camera_image)
+        self._search_frames_lock = threading.Lock()
+        self._search_frames: list[tuple[bytes, float]] = []  # [(jpeg, heading_deg), ...]
 
         # QoS for sensor topics (best-effort — matches typical LiDAR/camera publishers)
         sensor_qos = QoSProfile(
@@ -529,15 +721,19 @@ class TurtleBot3Bridge:
         with self._image_lock:
             return self._image_data, self._image_stamp
 
-    def wait_for_fresh_frame(self, timeout=1.0):
+    def wait_for_fresh_frame(self, timeout=1.5):
         """Block until a camera frame newer than the current one arrives.
 
         This ensures the returned image was captured *after* this method was
         called — critical for avoiding stale / motion-blurred frames after a
         turn or other motion command.
 
+        Waits for **two** new frames to arrive: the first frame after a stop
+        may still contain motion blur or a transitional image; the second
+        frame is reliably stable.
+
         Args:
-            timeout: Maximum seconds to wait for a new frame.
+            timeout: Maximum seconds to wait for new frames.
 
         Returns:
             tuple: ``(jpeg_bytes, iso_timestamp)`` of the fresh frame,
@@ -546,12 +742,17 @@ class TurtleBot3Bridge:
         with self._image_lock:
             old_stamp = self._image_stamp
 
+        frames_seen = 0
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             time.sleep(0.05)  # 50 ms poll — well within one camera frame
             with self._image_lock:
                 if self._image_stamp is not None and self._image_stamp != old_stamp:
-                    return self._image_data, self._image_stamp
+                    frames_seen += 1
+                    if frames_seen >= 2:
+                        return self._image_data, self._image_stamp
+                    # Update old_stamp to wait for the next distinct frame
+                    old_stamp = self._image_stamp
 
         # Timeout — return whatever we have (better than nothing)
         with self._image_lock:
@@ -584,7 +785,7 @@ class TurtleBot3Bridge:
         handler = type('BoundMJPEGHandler', (_MJPEGHandler,), {'bridge_ref': self})
 
         try:
-            server = HTTPServer(('0.0.0.0', port), handler)
+            server = _ThreadedHTTPServer(('0.0.0.0', port), handler)
         except OSError as e:
             _stderr(f"Failed to start camera viewer on port {port}: {e}")
             raise
@@ -615,6 +816,165 @@ class TurtleBot3Bridge:
             self._viewer_server = None
             self._viewer_port = None
             _stderr("Camera viewer stopped")
+
+    def set_mosaic(self, jpeg_bytes: bytes):
+        """Store the latest panoramic mosaic for the web viewer.
+
+        Called by rotate_and_scan after building the mosaic.
+        """
+        import datetime
+        with self._mosaic_lock:
+            self._mosaic_data = jpeg_bytes
+            self._mosaic_stamp = datetime.datetime.now().isoformat(timespec='seconds')
+        _stderr(f"Mosaic updated ({len(jpeg_bytes)} bytes)")
+
+    # ------------------------------------------------------------------
+    # Progressive search-frame accumulator
+    # ------------------------------------------------------------------
+
+    def add_search_frame(self, jpeg_bytes: bytes, heading_deg: float):
+        """Append a camera frame captured during step-by-step search.
+
+        Automatically rebuilds the mosaic for the web viewer so the
+        operator can follow along in real time.
+        """
+        with self._search_frames_lock:
+            self._search_frames.append((jpeg_bytes, heading_deg))
+            frames = list(self._search_frames)
+        _stderr(f"Search frame #{len(frames)} added (heading {heading_deg:.0f}°)")
+        self._rebuild_mosaic_from_frames(frames)
+
+    def clear_search_frames(self):
+        """Reset the accumulated search frames (new search or relocation)."""
+        with self._search_frames_lock:
+            self._search_frames.clear()
+        _stderr("Search frames cleared")
+
+    def _rebuild_mosaic_from_frames(self, frames: list[tuple[bytes, float]]):
+        """Build a progressive panoramic strip from accumulated frames.
+
+        Uses heading-based placement (fast, no feature matching) so the
+        operator sees a growing panorama in the web viewer as the robot
+        rotates.  Falls back to a simple grid if fewer than 2 frames are
+        available.
+        """
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            import io, math, datetime
+            import numpy as np
+
+            images = []
+            headings = []
+            for jpeg, hdg in frames:
+                img = Image.open(io.BytesIO(jpeg))
+                images.append(img)
+                headings.append(hdg)
+
+            if not images:
+                return
+
+            # With only 1 frame, just show it with a heading label
+            if len(images) < 2:
+                cw, ch = images[0].size
+                scale = min(1.0, 480 / ch)
+                cw_s, ch_s = int(cw * scale), int(ch * scale)
+                label_h = 22
+                canvas = Image.new("RGB", (cw_s, ch_s + label_h), (30, 30, 30))
+                thumb = images[0].resize((cw_s, ch_s), Image.LANCZOS)
+                canvas.paste(thumb, (0, label_h))
+                draw = ImageDraw.Draw(canvas)
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+                except Exception:
+                    font = ImageFont.load_default()
+                draw.text((4, 2), f"[1] {headings[0]:.0f}°", fill=(255, 255, 100), font=font)
+                buf = io.BytesIO()
+                canvas.save(buf, format="JPEG", quality=85)
+                self.set_mosaic(buf.getvalue())
+                return
+
+            # --- Heading-based panoramic strip ---
+            HFOV = 62.0  # camera horizontal FOV in degrees
+            CANVAS_H = 480
+
+            # Normalise headings to [0, 360) and sort by heading
+            norm_hdg = [(h % 360.0) for h in headings]
+            order = sorted(range(len(norm_hdg)), key=lambda i: norm_hdg[i])
+            sorted_hdg = [norm_hdg[i] for i in order]
+            sorted_imgs = [images[i] for i in order]
+
+            span_start = sorted_hdg[0] - HFOV / 2.0
+            span_end = sorted_hdg[-1] + HFOV / 2.0
+            total_span = max(span_end - span_start, HFOV)
+
+            first_w, first_h = sorted_imgs[0].size
+            px_per_deg = first_w / HFOV
+            canvas_w = int(total_span * px_per_deg)
+            scale_y = CANVAS_H / first_h
+            frame_w = int(first_w * scale_y)
+            frame_h = CANVAS_H
+
+            label_h = 24
+            canvas = Image.new("RGB", (canvas_w, frame_h + label_h), (30, 30, 30))
+            acc = np.zeros((frame_h, canvas_w, 3), dtype=np.float64)
+            weight = np.zeros((frame_h, canvas_w), dtype=np.float64)
+
+            for img, hdg in zip(sorted_imgs, sorted_hdg):
+                resized = img.resize((frame_w, frame_h), Image.LANCZOS)
+                arr = np.array(resized, dtype=np.float64)
+                centre_x = int((hdg - span_start) * px_per_deg)
+                x0 = centre_x - frame_w // 2
+                x1 = x0 + frame_w
+                src_x0 = max(0, -x0)
+                src_x1 = frame_w - max(0, x1 - canvas_w)
+                dst_x0 = max(0, x0)
+                dst_x1 = min(canvas_w, x1)
+                if dst_x1 <= dst_x0:
+                    continue
+                strip_w = src_x1 - src_x0
+                blend = np.linspace(0, 1, strip_w // 2 + 1)
+                blend = np.concatenate([blend, blend[-2::-1]])
+                if len(blend) < strip_w:
+                    blend = np.append(blend, blend[-1:])
+                blend = blend[:strip_w]
+                blend = np.clip(blend, 0.05, 1.0)
+                acc[:, dst_x0:dst_x1, :] += arr[:, src_x0:src_x1, :] * blend[np.newaxis, :, np.newaxis]
+                weight[:, dst_x0:dst_x1] += blend[np.newaxis, :]
+
+            weight_mask = weight > 0
+            for c in range(3):
+                acc[:, :, c][weight_mask] /= weight[weight_mask]
+            strip_arr = np.clip(acc, 0, 255).astype(np.uint8)
+            strip_img = Image.fromarray(strip_arr)
+            canvas.paste(strip_img, (0, label_h))
+
+            # Draw heading ticks
+            draw = ImageDraw.Draw(canvas)
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+            except Exception:
+                font = ImageFont.load_default()
+
+            tick_interval = 30.0
+            tick_start = math.ceil(span_start / tick_interval) * tick_interval
+            tick = tick_start
+            while tick <= span_end:
+                tx = int((tick - span_start) * px_per_deg)
+                if 0 <= tx < canvas_w:
+                    draw.line([(tx, label_h - 6), (tx, label_h)], fill=(200, 200, 200), width=1)
+                    draw.text((tx + 2, 2), f"{tick % 360:.0f}°", fill=(255, 255, 100), font=font)
+                tick += tick_interval
+
+            for idx, hdg in enumerate(sorted_hdg):
+                tx = int((hdg - span_start) * px_per_deg)
+                if 0 <= tx < canvas_w:
+                    draw.line([(tx, label_h - 10), (tx, label_h)], fill=(100, 255, 100), width=2)
+
+            buf = io.BytesIO()
+            canvas.save(buf, format="JPEG", quality=85)
+            self.set_mosaic(buf.getvalue())
+        except Exception as exc:
+            _stderr(f"WARNING: panoramic strip rebuild failed: {exc}")
 
     @property
     def camera_viewer_url(self):
@@ -763,8 +1123,10 @@ class TurtleBot3Bridge:
         self._cmd_vel_pub.publish(twist)
 
     def stop(self):
-        """Emergency stop — publish zero velocity."""
-        self._publish_twist(0.0, 0.0)
+        """Emergency stop — publish zero velocity multiple times for reliable braking."""
+        for _ in range(5):
+            self._publish_twist(0.0, 0.0)
+            time.sleep(0.02)
         logger.info("STOP command sent")
 
     def _wait_for_odom(self, timeout=5.0):
@@ -918,25 +1280,6 @@ class TurtleBot3Bridge:
                         "message": f"Timed out after {timeout}s",
                     }
 
-                # Safety check: don't rotate into a very close obstacle
-                front_dist = self.check_obstacle(direction="front")
-                if front_dist is not None and front_dist < 0.15:
-                    self.stop()
-                    cur = self.get_odom()
-                    return {
-                        "success": False,
-                        "obstacle_detected": True,
-                        "obstacle_distance_m": round(front_dist, 3),
-                        "angle_requested_deg": angle_deg,
-                        "angle_actual_deg": round(math.degrees(accumulated), 2),
-                        "start_yaw_deg": round(math.degrees(start_yaw), 2),
-                        "end_yaw_deg": round(cur["orientation_yaw_deg"], 2),
-                        "message": (
-                            f"Obstacle very close ({front_dist:.2f}m) in front "
-                            f"during turn. Stopped after {math.degrees(accumulated):.1f}°."
-                        ),
-                    }
-
                 cur = self.get_odom()
                 cur_yaw = cur["orientation_yaw_rad"]
                 delta = _normalize_angle(cur_yaw - prev_yaw)
@@ -945,15 +1288,18 @@ class TurtleBot3Bridge:
 
                 if abs(accumulated) >= target_rad_abs:
                     self.stop()
-                    # Let the robot physically decelerate and the camera
-                    # publish a stable, non-blurred frame before returning.
+                    # Wait for the robot to physically settle, then read
+                    # final yaw from odometry for an accurate report.
                     time.sleep(0.3)
+                    final = self.get_odom()
+                    final_yaw = final["orientation_yaw_rad"] if final else cur_yaw
+                    final_acc = accumulated + _normalize_angle(final_yaw - prev_yaw)
                     return {
                         "success": True,
                         "angle_requested_deg": angle_deg,
-                        "angle_actual_deg": round(math.degrees(accumulated), 2),
+                        "angle_actual_deg": round(math.degrees(final_acc), 2),
                         "start_yaw_deg": round(math.degrees(start_yaw), 2),
-                        "end_yaw_deg": round(cur["orientation_yaw_deg"], 2),
+                        "end_yaw_deg": round(math.degrees(final_yaw), 2),
                         "message": "Target angle reached",
                     }
 

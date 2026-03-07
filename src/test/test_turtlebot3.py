@@ -601,3 +601,305 @@ class TestImageInjection:
         messages = []
         _maybe_inject_image("/tmp/nonexistent_image_12345.png", messages)
         assert len(messages) == 0
+
+
+# ---------------------------------------------------------------------------
+# Panoramic stitching helpers
+# ---------------------------------------------------------------------------
+
+def _make_test_jpeg(width=640, height=480, color=(128, 64, 32)):
+    """Create a synthetic JPEG image as bytes."""
+    from PIL import Image as PILImage
+    import io
+    img = PILImage.new("RGB", (width, height), color)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    return buf.getvalue()
+
+
+def _make_gradient_jpeg(width=640, height=480, offset=0):
+    """Create a gradient JPEG (useful for feature-based stitching tests).
+
+    The gradient shifts by *offset* pixels so adjacent frames share
+    overlapping content — this gives OpenCV features to match on.
+    """
+    import numpy as np
+    from PIL import Image as PILImage
+    import io
+
+    arr = np.zeros((height, width, 3), dtype=np.uint8)
+    for x in range(width):
+        val = int(((x + offset) % width) / width * 255)
+        arr[:, x, :] = [val, 255 - val, 128]
+    # Add some noise for feature matching
+    noise = np.random.randint(0, 30, arr.shape, dtype=np.uint8)
+    arr = np.clip(arr.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    img = PILImage.fromarray(arr)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+class TestBuildGridMosaic:
+    """Test the grid mosaic builder (fallback layout)."""
+
+    def test_basic_grid(self):
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_grid_mosaic
+        from PIL import Image as PILImage
+        import io
+
+        frames = [_make_test_jpeg() for _ in range(6)]
+        headings = [0.0, 30.0, 60.0, 90.0, 120.0, 150.0]
+        result = _build_grid_mosaic(frames, headings)
+
+        assert isinstance(result, bytes)
+        assert len(result) > 100
+        # Should be a valid JPEG
+        img = PILImage.open(io.BytesIO(result))
+        assert img.format == "JPEG"
+        # Grid of 6 → 3×2
+        assert img.width > 300
+        assert img.height > 200
+
+    def test_empty_frames_raises(self):
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_grid_mosaic
+
+        with pytest.raises(ValueError, match="No frames"):
+            _build_grid_mosaic([], [])
+
+
+class TestBuildHeadingStrip:
+    """Test the heading-based cylindrical strip builder."""
+
+    def test_basic_strip(self):
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_heading_strip
+        from PIL import Image as PILImage
+        import io
+
+        frames = [_make_test_jpeg(color=(i * 20, 100, 200)) for i in range(6)]
+        headings = [0.0, 30.0, 60.0, 90.0, 120.0, 150.0]
+        result = _build_heading_strip(frames, headings)
+
+        assert isinstance(result, bytes)
+        img = PILImage.open(io.BytesIO(result))
+        assert img.format == "JPEG"
+        # Strip should be wider than a single frame
+        assert img.width > 640
+
+    def test_single_frame(self):
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_heading_strip
+
+        # Single frame should still work (degenerates to one frame on strip)
+        frames = [_make_test_jpeg()]
+        headings = [45.0]
+        result = _build_heading_strip(frames, headings)
+        assert isinstance(result, bytes)
+        assert len(result) > 100
+
+    def test_empty_frames_raises(self):
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_heading_strip
+
+        with pytest.raises(ValueError, match="No frames"):
+            _build_heading_strip([], [])
+
+    def test_full_360_strip(self):
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_heading_strip
+        from PIL import Image as PILImage
+        import io
+
+        # 15 frames at 24° steps covering 360°
+        frames = [_make_test_jpeg(color=(i * 15, 50 + i * 10, 200)) for i in range(15)]
+        headings = [i * 24.0 for i in range(15)]
+        result = _build_heading_strip(frames, headings)
+
+        img = PILImage.open(io.BytesIO(result))
+        # Should be quite wide for a full 360° panorama
+        assert img.width > 2000
+
+
+class TestStitchPanorama:
+    """Test the hybrid _stitch_panorama function."""
+
+    def test_returns_tuple(self):
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _stitch_panorama
+
+        frames = [_make_test_jpeg() for _ in range(4)]
+        headings = [0.0, 30.0, 60.0, 90.0]
+        result = _stitch_panorama(frames, headings)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        jpeg_bytes, method = result
+        assert isinstance(jpeg_bytes, bytes)
+        assert method in ('opencv_stitcher', 'heading_strip', 'grid_mosaic')
+
+    def test_method_label_is_string(self):
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _stitch_panorama
+
+        frames = [_make_test_jpeg() for _ in range(3)]
+        headings = [0.0, 24.0, 48.0]
+        _, method = _stitch_panorama(frames, headings)
+        assert isinstance(method, str)
+        assert len(method) > 0
+
+    def test_empty_frames_raises(self):
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _stitch_panorama
+
+        with pytest.raises(ValueError, match="No frames"):
+            _stitch_panorama([], [])
+
+    def test_fallback_without_opencv(self):
+        """When cv2 is not importable, should fall back to heading_strip."""
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _stitch_panorama
+        import builtins
+
+        original_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == 'cv2':
+                raise ImportError("Mocked cv2 not available")
+            return original_import(name, *args, **kwargs)
+
+        frames = [_make_test_jpeg(color=(i * 30, 100, 50)) for i in range(5)]
+        headings = [0.0, 24.0, 48.0, 72.0, 96.0]
+
+        with patch.object(builtins, '__import__', side_effect=mock_import):
+            jpeg_bytes, method = _stitch_panorama(frames, headings)
+
+        assert method in ('heading_strip', 'grid_mosaic')
+        assert isinstance(jpeg_bytes, bytes)
+        assert len(jpeg_bytes) > 100
+
+    def test_opencv_failure_falls_back(self):
+        """When OpenCV stitcher fails, should fall back to heading_strip."""
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _stitch_panorama
+
+        frames = [_make_test_jpeg() for _ in range(4)]
+        headings = [0.0, 24.0, 48.0, 72.0]
+
+        # Mock cv2 to return a failure status
+        mock_cv2 = MagicMock()
+        mock_cv2.Stitcher_PANORAMA = 0
+        mock_cv2.Stitcher_OK = 0
+        mock_stitcher = MagicMock()
+        mock_stitcher.stitch.return_value = (1, None)  # status 1 = failure
+        mock_cv2.Stitcher.create.return_value = mock_stitcher
+        mock_cv2.imdecode = MagicMock(return_value=MagicMock())
+        mock_cv2.IMREAD_COLOR = 1
+
+        with patch.dict('sys.modules', {'cv2': mock_cv2}):
+            jpeg_bytes, method = _stitch_panorama(frames, headings)
+
+        # Should have fallen through to heading_strip or grid
+        assert method in ('heading_strip', 'grid_mosaic')
+        assert isinstance(jpeg_bytes, bytes)
+
+
+class TestRotateAndScan:
+    """Test the rotate_and_scan MCP tool."""
+
+    def _setup_bridge_for_scan(self, bridge):
+        """Configure bridge to deliver fake frames and odometry for a scan."""
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        tb3_mcp._bridge = bridge
+
+        # Seed odometry
+        msg = MagicMock()
+        msg.pose.pose.position.x = 0.0
+        msg.pose.pose.position.y = 0.0
+        msg.pose.pose.position.z = 0.0
+        msg.pose.pose.orientation.x = 0.0
+        msg.pose.pose.orientation.y = 0.0
+        msg.pose.pose.orientation.z = 0.0
+        msg.pose.pose.orientation.w = 1.0
+        msg.twist.twist.linear.x = 0.0
+        msg.twist.twist.linear.y = 0.0
+        msg.twist.twist.angular.z = 0.0
+        stamp = MagicMock()
+        stamp.sec = 1000
+        stamp.nanosec = 0
+        msg.header.stamp = stamp
+        bridge._odom_cb(msg)
+
+        # Make turn() always succeed
+        step_count = [0]
+        def mock_turn(angle_deg, angular_speed=0.5, timeout=30.0):
+            step_count[0] += 1
+            actual = abs(angle_deg)
+            # Update odom heading
+            new_yaw_deg = step_count[0] * actual
+            new_yaw_rad = math.radians(new_yaw_deg)
+            odom_msg = MagicMock()
+            odom_msg.pose.pose.position.x = 0.0
+            odom_msg.pose.pose.position.y = 0.0
+            odom_msg.pose.pose.position.z = 0.0
+            s = math.sin(new_yaw_rad / 2)
+            c = math.cos(new_yaw_rad / 2)
+            odom_msg.pose.pose.orientation.x = 0.0
+            odom_msg.pose.pose.orientation.y = 0.0
+            odom_msg.pose.pose.orientation.z = s
+            odom_msg.pose.pose.orientation.w = c
+            odom_msg.twist.twist.linear.x = 0.0
+            odom_msg.twist.twist.linear.y = 0.0
+            odom_msg.twist.twist.angular.z = 0.0
+            odom_msg.header.stamp = stamp
+            bridge._odom_cb(odom_msg)
+            return {"success": True, "angle_actual_deg": actual}
+        bridge.turn = mock_turn
+
+        # Make wait_for_fresh_frame return a synthetic JPEG
+        def mock_fresh_frame(timeout=1.5):
+            return _make_test_jpeg(color=(step_count[0] * 15, 100, 200)), "2025-01-01T00:00:00+00:00"
+        bridge.wait_for_fresh_frame = mock_fresh_frame
+
+        return tb3_mcp
+
+    def test_rotate_and_scan_returns_panorama(self, bridge):
+        """rotate_and_scan should return a summary and an image."""
+        tb3_mcp = self._setup_bridge_for_scan(bridge)
+
+        result = tb3_mcp.rotate_and_scan(total_angle=120.0, step_angle=30.0)
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+        summary = result[0]
+        assert "Captured" in summary
+        assert "Stitch method" in summary
+
+    def test_rotate_and_scan_zero_frames_raises(self, bridge):
+        """rotate_and_scan should raise when no frames are captured."""
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        tb3_mcp._bridge = bridge
+
+        # Seed odom
+        msg = MagicMock()
+        msg.pose.pose.position.x = 0.0
+        msg.pose.pose.position.y = 0.0
+        msg.pose.pose.position.z = 0.0
+        msg.pose.pose.orientation.x = 0.0
+        msg.pose.pose.orientation.y = 0.0
+        msg.pose.pose.orientation.z = 0.0
+        msg.pose.pose.orientation.w = 1.0
+        msg.twist.twist.linear.x = 0.0
+        msg.twist.twist.linear.y = 0.0
+        msg.twist.twist.angular.z = 0.0
+        stamp = MagicMock()
+        stamp.sec = 1000
+        stamp.nanosec = 0
+        msg.header.stamp = stamp
+        bridge._odom_cb(msg)
+
+        # Turn succeeds but no camera frames
+        bridge.turn = MagicMock(return_value={"success": True, "angle_actual_deg": 24.0})
+        bridge.wait_for_fresh_frame = MagicMock(return_value=(None, None))
+
+        with pytest.raises(ValueError, match="captured 0 frames"):
+            tb3_mcp.rotate_and_scan(total_angle=90.0, step_angle=30.0)
+
+    def test_rotate_and_scan_default_step_is_24(self, bridge):
+        """Default step_angle should be 24° (15 frames per 360°)."""
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        import inspect
+
+        sig = inspect.signature(tb3_mcp.rotate_and_scan)
+        assert sig.parameters["step_angle"].default == 24.0

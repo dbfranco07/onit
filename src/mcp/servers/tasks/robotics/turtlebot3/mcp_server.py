@@ -81,6 +81,14 @@ def get_camera_image() -> Image:
             f"on topic '{bridge._camera_topic}'."
         )
 
+    # Feed frame into progressive mosaic for the web viewer
+    try:
+        odom = bridge.get_odom()
+        heading = odom["yaw_deg"] if odom else 0.0
+        bridge.add_search_frame(image_bytes, heading)
+    except Exception:
+        pass  # non-critical — don't break the camera tool
+
     # FastMCP Image() accepts raw bytes and returns ImageContent
     return Image(data=image_bytes, format="jpeg")
 
@@ -458,87 +466,514 @@ def diagnose_ros() -> str:
 
 
 # =========================================================================
+# PANORAMIC STITCHING / MOSAIC BUILDERS
+# =========================================================================
+
+# Camera horizontal field-of-view in degrees (TurtleBot3 Burger Raspberry Pi
+# Camera Module v2 — measured/estimated).
+_CAMERA_HFOV_DEG = 62.0
+
+
+def _build_grid_mosaic(
+    jpeg_frames: list[bytes],
+    headings: list[float],
+    cell_width: int = 320,
+) -> bytes:
+    """Arrange captured frames into a labeled grid image (fallback layout).
+
+    Returns JPEG bytes of the mosaic.  Each cell is resized to *cell_width*
+    pixels wide (height scales proportionally) and labelled with the heading
+    at capture time.
+
+    Layout heuristic:
+        cols = ceil(sqrt(n))
+        rows = ceil(n / cols)
+    e.g. 12 frames → 4×3, 15 frames → 4×4 (last row may be partial).
+    """
+    import io
+    import math
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+
+    if not jpeg_frames:
+        raise ValueError("No frames to build mosaic from.")
+
+    # Decode & resize all frames
+    cells = []
+    for raw in jpeg_frames:
+        img = PILImage.open(io.BytesIO(raw))
+        ratio = cell_width / img.width
+        new_h = int(img.height * ratio)
+        img = img.resize((cell_width, new_h), PILImage.LANCZOS)
+        cells.append(img)
+
+    cell_h = cells[0].height  # assume all frames are the same size
+    n = len(cells)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+
+    label_h = 24  # pixels reserved for the heading label
+    mosaic_w = cols * cell_width
+    mosaic_h = rows * (cell_h + label_h)
+
+    mosaic = PILImage.new("RGB", (mosaic_w, mosaic_h), color=(30, 30, 30))
+    draw = ImageDraw.Draw(mosaic)
+
+    # Use default font (always available)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+    except Exception:
+        font = ImageFont.load_default()
+
+    for idx, cell in enumerate(cells):
+        col = idx % cols
+        row = idx // cols
+        x = col * cell_width
+        y = row * (cell_h + label_h)
+
+        # Paste frame
+        mosaic.paste(cell, (x, y + label_h))
+
+        # Draw label bar
+        heading_str = f"{headings[idx]:.0f}°" if idx < len(headings) else f"#{idx+1}"
+        label_text = f"[{idx+1}] {heading_str}"
+        draw.rectangle([x, y, x + cell_width, y + label_h], fill=(50, 50, 50))
+        draw.text((x + 6, y + 3), label_text, fill=(255, 255, 100), font=font)
+
+    # Encode as JPEG
+    buf = io.BytesIO()
+    mosaic.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def _build_heading_strip(
+    jpeg_frames: list[bytes],
+    headings: list[float],
+    canvas_height: int = 480,
+    hfov: float = _CAMERA_HFOV_DEG,
+) -> bytes:
+    """Build a panorama by assigning each output column to the nearest frame.
+
+    **Nearest-center compositing** — for every output pixel column the
+    *single* frame whose capture heading is closest is used.  Only a very
+    narrow gradient (``SEAM_PX``) is applied at the boundary between two
+    frames so there are no ghosting / double-exposure artefacts.
+
+    When the total angular span exceeds 200° the panorama is split into
+    **two rows** (top = first half, bottom = second half) so the VLM
+    receives a more square image with larger visible objects.
+
+    Heading tick marks and per-frame labels are drawn at the top of each
+    row for spatial reference.
+
+    Returns JPEG bytes.
+    """
+    import io
+    import math
+    import numpy as np
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+
+    if not jpeg_frames:
+        raise ValueError("No frames to build heading strip from.")
+
+    SEAM_PX = 8  # half-width of gradient transition at seams
+
+    # --- Decode images ---
+    images = []
+    for raw in jpeg_frames:
+        img = PILImage.open(io.BytesIO(raw))
+        images.append(img)
+
+    # Normalise headings to [0, 360) and sort left-to-right
+    norm_headings = [(h % 360.0) for h in headings]
+    order = sorted(range(len(norm_headings)), key=lambda i: norm_headings[i])
+    sorted_hdg = [norm_headings[i] for i in order]
+    sorted_imgs = [images[i] for i in order]
+
+    n = len(sorted_imgs)
+    span_start = sorted_hdg[0] - hfov / 2.0
+    span_end = sorted_hdg[-1] + hfov / 2.0
+    total_span = max(span_end - span_start, hfov)
+
+    first_w, first_h = sorted_imgs[0].size
+    px_per_deg = first_w / hfov
+    row_w = int(total_span * px_per_deg)
+    scale_y = canvas_height / first_h
+    frame_w = int(first_w * scale_y)
+    frame_h = canvas_height
+
+    # --- Resize all frames once ---
+    resized_arrs = []
+    for img in sorted_imgs:
+        resized_arrs.append(np.array(
+            img.resize((frame_w, frame_h), PILImage.LANCZOS), dtype=np.uint8
+        ))
+
+    # --- Build single-row strip via nearest-center ---
+    def _compose_strip(strip_w, strip_hdg, strip_arrs, strip_order, s_start):
+        """Compose one horizontal strip.  Returns (uint8 array, draw-info)."""
+        out = np.zeros((frame_h, strip_w, 3), dtype=np.uint8)
+        m = len(strip_hdg)
+        if m == 0:
+            return out, []
+
+        # For each output column, find nearest frame
+        col_headings = np.linspace(s_start, s_start + strip_w / px_per_deg, strip_w)
+        hdg_arr = np.array(strip_hdg)
+        # |col_heading - frame_heading| → shape (strip_w, m)
+        diffs = np.abs(col_headings[:, None] - hdg_arr[None, :])
+        nearest = np.argmin(diffs, axis=1)  # index into strip arrays
+
+        # Vector lookup: for each column, copy from the correct frame
+        for fi in range(m):
+            cols = np.where(nearest == fi)[0]
+            if len(cols) == 0:
+                continue
+            centre_px = int((strip_hdg[fi] - s_start) * px_per_deg)
+            for c in cols:
+                src_x = int((c - centre_px) + frame_w // 2)
+                src_x = max(0, min(frame_w - 1, src_x))
+                out[:, c, :] = strip_arrs[fi][:, src_x, :]
+
+        # Apply narrow seam blending at frame boundaries
+        boundary_cols = []
+        for c in range(1, strip_w):
+            if nearest[c] != nearest[c - 1]:
+                boundary_cols.append(c)
+
+        for bc in boundary_cols:
+            fi_left = nearest[max(0, bc - 1)]
+            fi_right = nearest[min(strip_w - 1, bc)]
+            blend_start = max(0, bc - SEAM_PX)
+            blend_end = min(strip_w, bc + SEAM_PX)
+            for bx in range(blend_start, blend_end):
+                alpha = (bx - blend_start) / max(1, blend_end - blend_start - 1)
+                # Get pixels from both frames
+                cx_l = int((bx - int((strip_hdg[fi_left] - s_start) * px_per_deg)) + frame_w // 2)
+                cx_r = int((bx - int((strip_hdg[fi_right] - s_start) * px_per_deg)) + frame_w // 2)
+                cx_l = max(0, min(frame_w - 1, cx_l))
+                cx_r = max(0, min(frame_w - 1, cx_r))
+                pix_l = strip_arrs[fi_left][:, cx_l, :].astype(np.float32)
+                pix_r = strip_arrs[fi_right][:, cx_r, :].astype(np.float32)
+                out[:, bx, :] = np.clip(pix_l * (1 - alpha) + pix_r * alpha, 0, 255).astype(np.uint8)
+
+        return out, strip_order
+
+    # --- Decide layout: 1 row or 2 rows ---
+    use_two_rows = total_span > 200.0 and n >= 6
+    label_h = 30
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        font_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+        font_sm = font
+
+    if use_two_rows:
+        mid = n // 2
+        # Row 1: first half of frames
+        r1_hdg = sorted_hdg[:mid]
+        r1_arrs = resized_arrs[:mid]
+        r1_order = order[:mid]
+        r1_start = r1_hdg[0] - hfov / 2.0
+        r1_end = r1_hdg[-1] + hfov / 2.0
+        r1_w = int((r1_end - r1_start) * px_per_deg)
+
+        # Row 2: second half of frames
+        r2_hdg = sorted_hdg[mid:]
+        r2_arrs = resized_arrs[mid:]
+        r2_order = order[mid:]
+        r2_start = r2_hdg[0] - hfov / 2.0
+        r2_end = r2_hdg[-1] + hfov / 2.0
+        r2_w = int((r2_end - r2_start) * px_per_deg)
+
+        canvas_w = max(r1_w, r2_w)
+        canvas_h = 2 * (frame_h + label_h)
+        canvas = PILImage.new("RGB", (canvas_w, canvas_h), (30, 30, 30))
+        draw = ImageDraw.Draw(canvas)
+
+        # Compose row 1
+        strip1, _ = _compose_strip(r1_w, r1_hdg, r1_arrs, r1_order, r1_start)
+        canvas.paste(PILImage.fromarray(strip1), (0, label_h))
+        _draw_heading_labels(draw, r1_hdg, r1_order, r1_start, r1_end,
+                             px_per_deg, label_h, 0, canvas_w, font, font_sm)
+
+        # Compose row 2
+        y2 = frame_h + label_h
+        strip2, _ = _compose_strip(r2_w, r2_hdg, r2_arrs, r2_order, r2_start)
+        canvas.paste(PILImage.fromarray(strip2), (0, y2 + label_h))
+        _draw_heading_labels(draw, r2_hdg, r2_order, r2_start, r2_end,
+                             px_per_deg, label_h, y2, canvas_w, font, font_sm)
+    else:
+        # Single row
+        canvas_w = row_w
+        canvas_h = frame_h + label_h
+        canvas = PILImage.new("RGB", (canvas_w, canvas_h), (30, 30, 30))
+        draw = ImageDraw.Draw(canvas)
+
+        strip, _ = _compose_strip(row_w, sorted_hdg, resized_arrs, order, span_start)
+        canvas.paste(PILImage.fromarray(strip), (0, label_h))
+        _draw_heading_labels(draw, sorted_hdg, order, span_start, span_end,
+                             px_per_deg, label_h, 0, canvas_w, font, font_sm)
+
+    buf = io.BytesIO()
+    canvas.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def _draw_heading_labels(draw, sorted_hdg, order, span_start, span_end,
+                         px_per_deg, label_h, y_offset, canvas_w, font, font_sm):
+    """Draw heading ticks and frame markers for one panorama row."""
+    import math
+
+    # Background bar
+    draw.rectangle([(0, y_offset), (canvas_w, y_offset + label_h)],
+                   fill=(20, 20, 20))
+
+    # Degree ticks every 30°
+    tick_interval = 30.0
+    tick = math.ceil(span_start / tick_interval) * tick_interval
+    while tick <= span_end:
+        tx = int((tick - span_start) * px_per_deg)
+        if 0 <= tx < canvas_w:
+            draw.line([(tx, y_offset + label_h - 8), (tx, y_offset + label_h)],
+                      fill=(200, 200, 200), width=2)
+            draw.text((tx + 3, y_offset + 2), f"{tick % 360:.0f}°",
+                      fill=(255, 255, 100), font=font)
+        tick += tick_interval
+
+    # Frame markers
+    for idx, hdg in enumerate(sorted_hdg):
+        tx = int((hdg - span_start) * px_per_deg)
+        if 0 <= tx < canvas_w:
+            draw.line([(tx, y_offset + label_h - 12), (tx, y_offset + label_h)],
+                      fill=(100, 255, 100), width=2)
+            draw.text((tx + 3, y_offset + 14), f"[{order[idx]+1}]",
+                      fill=(100, 255, 100), font=font_sm)
+
+
+def _stitch_panorama(
+    jpeg_frames: list[bytes],
+    headings: list[float],
+) -> tuple[bytes, str]:
+    """Build a 360° panoramic image from ordered camera frames.
+
+    Strategy (hybrid):
+      1. **OpenCV Stitcher** — feature-based homography + multi-band blend.
+         Produces the best result when sufficient texture is present.
+      2. **Heading-based strip** — cylindrical projection using odometry.
+         Always works; no feature matching required.
+      3. **Grid mosaic** — labeled thumbnail grid (last resort).
+
+    Returns:
+        ``(jpeg_bytes, method)`` where *method* is one of
+        ``'opencv_stitcher'``, ``'heading_strip'``, or ``'grid_mosaic'``.
+    """
+    import io
+    import numpy as np
+
+    if not jpeg_frames:
+        raise ValueError("No frames to stitch.")
+
+    # --- Attempt 1: OpenCV Stitcher ---
+    try:
+        import cv2
+
+        cv_images = []
+        for raw in jpeg_frames:
+            arr = np.frombuffer(raw, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is not None:
+                cv_images.append(img)
+
+        if len(cv_images) >= 2:
+            stitcher = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
+            status, pano = stitcher.stitch(cv_images)
+            if status == cv2.Stitcher_OK and pano is not None:
+                # Encode result as JPEG
+                _, buf = cv2.imencode('.jpg', pano, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                _stderr(f"OpenCV stitcher succeeded: {pano.shape[1]}×{pano.shape[0]}")
+                return buf.tobytes(), 'opencv_stitcher'
+            else:
+                _stderr(f"OpenCV stitcher returned status {status} — falling back")
+    except ImportError:
+        _stderr("OpenCV not available — skipping feature-based stitcher")
+    except Exception as exc:
+        _stderr(f"OpenCV stitcher failed: {exc} — falling back")
+
+    # --- Attempt 2: Heading-based cylindrical strip ---
+    try:
+        result = _build_heading_strip(jpeg_frames, headings)
+        _stderr("Heading-based strip succeeded")
+        return result, 'heading_strip'
+    except Exception as exc:
+        _stderr(f"Heading strip failed: {exc} — falling back to grid")
+
+    # --- Attempt 3: Grid mosaic (always works) ---
+    result = _build_grid_mosaic(jpeg_frames, headings)
+    return result, 'grid_mosaic'
+
+
+# =========================================================================
 # ROTATE AND SCAN TOOL
 # =========================================================================
 
 @mcp.tool(
-    title="Rotate and Scan",
+    title="Rotate and Scan (panoramic)",
     description=(
-        "Slowly rotate the robot while capturing a stable camera frame at "
-        "every step. Returns ALL captured frames so you can examine them in "
-        "one go. This is far more reliable than issuing individual turn + "
-        "get_camera_image calls because it guarantees a settling delay and "
-        "a fresh (non-blurred) frame at every heading.\n\n"
-        "Use this for 'find object' / search tasks instead of manual loops.\n\n"
-        "Defaults: 360° sweep in 30° steps (= 12 frames with ~32° overlap "
-        "given the 62° camera FOV).  Negative total_angle sweeps clockwise."
+        "Perform a full 360° rotation and return a SINGLE stitched panoramic "
+        "image of the entire surroundings.  The panorama is built by capturing "
+        "frames at regular intervals and stitching them into one continuous "
+        "wide image — NOT a grid of thumbnails.\n\n"
+        "This is the **PRIMARY tool for search tasks**: one call gives the "
+        "VLM a complete 360° view of the environment in a single image so "
+        "nothing is missed.  Use it as Step 1 whenever you need to find or "
+        "survey something.\n\n"
+        "Stitching pipeline: OpenCV feature-based stitcher → heading-based "
+        "cylindrical strip (fallback) → grid mosaic (last resort).\n\n"
+        "Defaults: 360° sweep in 24° steps (= 15 frames with ~38° overlap "
+        "given the 62° camera FOV). Negative total_angle sweeps clockwise.\n\n"
+        "Returns: a text summary + ONE panoramic JPEG."
     ),
 )
 def rotate_and_scan(
     total_angle: float = 360.0,
-    step_angle: float = 30.0,
+    step_angle: float = 24.0,
     settle_time: float = 0.3,
     speed: float = 0.3,
-) -> list:
-    """Rotate and capture camera frames at each step.
+):
+    """Rotate and capture camera frames at each step, returning a panorama.
 
     Args:
         total_angle: Total rotation in degrees (positive=CCW, negative=CW).
                      Default 360° for a full sweep.
-        step_angle:  Degrees per step.  Default 30° (12 steps for 360°).
+        step_angle:  Degrees per step.  Default 24° (15 steps for 360°,
+                     each with ~38° overlap given the 62° camera FOV).
         settle_time: Seconds to wait after each step for the robot to
                      decelerate and the camera to publish a stable frame.
                      Default 0.3 s.
-        speed:       Angular speed in rad/s.  Default 0.3 rad/s.
+        speed:       Angular speed in rad/s.  Default 0.3 rad/s (slow for
+                     accurate captures).
     """
     import time as _time
+    import math as _math
 
     bridge = _get_bridge()
 
-    direction = -1.0 if total_angle >= 0 else 1.0   # default sweep = CW
+    # Positive total_angle → CCW (positive turn angles)
+    # Negative total_angle → CW  (negative turn angles)
+    sign = 1.0 if total_angle >= 0 else -1.0
     total_abs = abs(total_angle)
     step_abs = abs(step_angle)
-    steps = max(1, int(round(total_abs / step_abs)))
+    max_steps = max(1, int(round(total_abs / step_abs)))
 
-    frames = []  # list[Image]
-    headings = []  # list[float] — yaw in degrees at each capture
+    raw_frames: list[bytes] = []   # raw JPEG bytes for mosaic builder
+    headings: list[float] = []     # yaw in degrees at each capture
 
-    for i in range(steps):
-        # Turn one step
-        bridge.turn(angle_deg=direction * step_abs, angular_speed=speed)
+    # Track total sweep via odometry so per-step overshoot is compensated
+    odom0 = bridge.get_odom()
+    sweep_start_yaw = _math.radians(odom0["orientation_yaw_deg"]) if odom0 else 0.0
+    total_target_rad = _math.radians(total_abs)
+    prev_yaw = sweep_start_yaw
+    sweep_accumulated_rad = 0.0  # absolute value of total rotation so far
 
-        # Extra settle time (on top of the 0.3 s inside turn())
+    direction_label = 'CCW' if sign > 0 else 'CW'
+    _stderr(f"rotate_and_scan: up to {max_steps} steps × {step_abs}° {direction_label}")
+
+    for i in range(max_steps):
+        # Calculate how much rotation remains for the total sweep
+        remaining_deg = total_abs - _math.degrees(sweep_accumulated_rad)
+        if remaining_deg < 2.0:
+            _stderr(f"  step {i+1}: sweep complete ({_math.degrees(sweep_accumulated_rad):.1f}° done)")
+            break
+
+        # Use the smaller of step_angle and remaining angle
+        this_step_deg = min(step_abs, remaining_deg)
+
+        # Turn one step (sign controls direction: positive=CCW, negative=CW)
+        _stderr(f"  step {i+1}/{max_steps}: turning {sign * this_step_deg:.1f}° ...")
+        result = bridge.turn(angle_deg=sign * this_step_deg, angular_speed=speed)
+        _stderr(f"  step {i+1}/{max_steps}: turn result: {result}")
+
+        # Use the actual angle from turn() result for sweep tracking
+        # (more reliable than re-reading odometry separately)
+        if result and result.get("success"):
+            actual_deg = abs(result.get("angle_actual_deg", 0))
+            sweep_accumulated_rad += _math.radians(actual_deg)
+        elif result:
+            _stderr(f"  step {i+1}/{max_steps}: turn FAILED: {result.get('message', '?')}")
+            # Still update from odometry in case partial rotation happened
+            odom_now = bridge.get_odom()
+            if odom_now:
+                cur_yaw = _math.radians(odom_now["orientation_yaw_deg"])
+                delta = cur_yaw - prev_yaw
+                while delta > _math.pi:
+                    delta -= 2 * _math.pi
+                while delta < -_math.pi:
+                    delta += 2 * _math.pi
+                sweep_accumulated_rad += abs(delta)
+                prev_yaw = cur_yaw
+
+        # Update prev_yaw for next iteration
+        odom_now = bridge.get_odom()
+        if odom_now:
+            prev_yaw = _math.radians(odom_now["orientation_yaw_deg"])
+
+        # Extra settle time for stable camera frame
         if settle_time > 0:
             _time.sleep(settle_time)
 
         # Wait for a genuinely fresh frame
-        image_bytes, timestamp = bridge.wait_for_fresh_frame(timeout=1.0)
+        image_bytes, timestamp = bridge.wait_for_fresh_frame(timeout=1.5)
 
         if image_bytes is not None:
-            frames.append(Image(data=image_bytes, format="jpeg"))
+            raw_frames.append(image_bytes)
+        else:
+            _stderr(f"  step {i+1}/{max_steps}: no frame captured")
 
         # Record heading for the summary
-        odom = bridge.get_odom()
-        if odom:
-            headings.append(round(odom["orientation_yaw_deg"], 1))
+        if odom_now:
+            headings.append(round(odom_now["orientation_yaw_deg"], 1))
+        else:
+            headings.append(round(i * step_abs * sign, 1))
 
-    if not frames:
+        _stderr(f"  step {i+1}/{max_steps}: heading={headings[-1]:.1f}° "
+                f"swept={_math.degrees(sweep_accumulated_rad):.1f}° "
+                f"frame={'OK' if image_bytes else 'MISS'}")
+
+    if not raw_frames:
         raise ValueError(
             "rotate_and_scan captured 0 frames. "
             "Is the camera node running?"
         )
 
-    # Return images directly — FastMCP serialises the list for the VLM.
-    # Also prepend a text summary so the model knows which heading each
-    # image corresponds to.
+    # Build the stitched panorama (hybrid: OpenCV → heading strip → grid)
+    pano_bytes, stitch_method = _stitch_panorama(raw_frames, headings)
+    pano_image = Image(data=pano_bytes, format="jpeg")
+
+    # Store panorama on bridge so the web viewer can display it
+    bridge.set_mosaic(pano_bytes)
+
+    swept_deg = _math.degrees(sweep_accumulated_rad)
+    method_desc = {
+        'opencv_stitcher': 'seamless feature-based panorama',
+        'heading_strip': 'heading-based cylindrical panorama',
+        'grid_mosaic': 'labeled grid mosaic (stitching unavailable)',
+    }.get(stitch_method, stitch_method)
+
     summary = (
-        f"Captured {len(frames)} frames over a {total_abs}° sweep "
-        f"({step_abs}° steps, {'CCW' if direction == 1.0 else 'CW'}).\n"
-        f"Headings (deg): {headings}\n"
-        "Examine each image carefully for the target object."
+        f"Captured {len(raw_frames)} frames over a {swept_deg:.0f}° sweep "
+        f"({step_abs:.0f}° steps, {direction_label}).\n"
+        f"Stitch method: {method_desc}.\n"
+        f"Headings (deg): {headings}\n\n"
+        "The attached panoramic image shows a CONTINUOUS 360° view of the "
+        "environment.  Scan the ENTIRE image from left to right — objects "
+        "appear at their true heading positions.  If the target is visible, "
+        "report its approximate heading (degrees) based on the tick marks "
+        "at the top of the image and describe what you see."
     )
-    # FastMCP allows returning mixed content; put text first, then images
-    return [summary] + frames
+
+    return [summary, pano_image]
 
 
 # =========================================================================

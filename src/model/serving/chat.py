@@ -259,13 +259,24 @@ def _maybe_inject_image(tool_response: str, messages: list, chat_ui=None, verbos
             })
 
         for path in image_paths:
-            ext = os.path.splitext(path)[1].lower()
             with open(path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-            mime = {
-                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
-            }.get(ext, "image/png")
+                raw = f.read()
+            b64 = base64.b64encode(raw).decode("utf-8")
+            # Auto-detect MIME from file magic bytes; fall back to extension.
+            if raw[:3] == b'\xff\xd8\xff':
+                mime = "image/jpeg"
+            elif raw[:8] == b'\x89PNG\r\n\x1a\n':
+                mime = "image/png"
+            elif raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
+                mime = "image/webp"
+            elif raw[:3] == b'GIF':
+                mime = "image/gif"  
+            else:
+                ext = os.path.splitext(path)[1].lower()
+                mime = {
+                    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                    ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
+                }.get(ext, "image/png")
             content_parts.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime};base64,{b64}"},
