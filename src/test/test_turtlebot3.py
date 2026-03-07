@@ -668,53 +668,54 @@ class TestBuildGridMosaic:
             _build_grid_mosaic([], [])
 
 
-class TestBuildHeadingStrip:
-    """Test the heading-based cylindrical strip builder."""
+class TestBuildContactSheet:
+    """Test the annotated contact-sheet grid builder."""
 
-    def test_basic_strip(self):
-        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_heading_strip
+    def test_basic_sheet(self):
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_contact_sheet
         from PIL import Image as PILImage
         import io
 
         frames = [_make_test_jpeg(color=(i * 20, 100, 200)) for i in range(6)]
         headings = [0.0, 30.0, 60.0, 90.0, 120.0, 150.0]
-        result = _build_heading_strip(frames, headings)
+        result = _build_contact_sheet(frames, headings)
 
         assert isinstance(result, bytes)
         img = PILImage.open(io.BytesIO(result))
         assert img.format == "JPEG"
-        # Strip should be wider than a single frame
-        assert img.width > 640
+        # Grid should be reasonably sized (not an ultra-wide strip)
+        assert img.width > 400
+        assert img.height > 300
 
     def test_single_frame(self):
-        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_heading_strip
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_contact_sheet
 
-        # Single frame should still work (degenerates to one frame on strip)
         frames = [_make_test_jpeg()]
         headings = [45.0]
-        result = _build_heading_strip(frames, headings)
+        result = _build_contact_sheet(frames, headings)
         assert isinstance(result, bytes)
         assert len(result) > 100
 
     def test_empty_frames_raises(self):
-        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_heading_strip
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_contact_sheet
 
         with pytest.raises(ValueError, match="No frames"):
-            _build_heading_strip([], [])
+            _build_contact_sheet([], [])
 
-    def test_full_360_strip(self):
-        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_heading_strip
+    def test_full_360_grid(self):
+        from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _build_contact_sheet
         from PIL import Image as PILImage
         import io
 
         # 15 frames at 24° steps covering 360°
         frames = [_make_test_jpeg(color=(i * 15, 50 + i * 10, 200)) for i in range(15)]
         headings = [i * 24.0 for i in range(15)]
-        result = _build_heading_strip(frames, headings)
+        result = _build_contact_sheet(frames, headings)
 
         img = PILImage.open(io.BytesIO(result))
-        # Should be quite wide for a full 360° panorama
-        assert img.width > 2000
+        # Grid has reasonable aspect ratio (not an extreme strip)
+        ratio = img.width / max(img.height, 1)
+        assert 0.5 < ratio < 4.0, f"Aspect ratio {ratio:.2f} is too extreme"
 
 
 class TestStitchPanorama:
@@ -731,7 +732,7 @@ class TestStitchPanorama:
         assert len(result) == 2
         jpeg_bytes, method = result
         assert isinstance(jpeg_bytes, bytes)
-        assert method in ('opencv_stitcher', 'heading_strip', 'grid_mosaic')
+        assert method in ('opencv_stitcher', 'contact_sheet')
 
     def test_method_label_is_string(self):
         from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _stitch_panorama
@@ -749,7 +750,7 @@ class TestStitchPanorama:
             _stitch_panorama([], [])
 
     def test_fallback_without_opencv(self):
-        """When cv2 is not importable, should fall back to heading_strip."""
+        """When cv2 is not importable, should fall back to contact_sheet."""
         from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _stitch_panorama
         import builtins
 
@@ -766,12 +767,12 @@ class TestStitchPanorama:
         with patch.object(builtins, '__import__', side_effect=mock_import):
             jpeg_bytes, method = _stitch_panorama(frames, headings)
 
-        assert method in ('heading_strip', 'grid_mosaic')
+        assert method == 'contact_sheet'
         assert isinstance(jpeg_bytes, bytes)
         assert len(jpeg_bytes) > 100
 
     def test_opencv_failure_falls_back(self):
-        """When OpenCV stitcher fails, should fall back to heading_strip."""
+        """When OpenCV stitcher fails, should fall back to contact_sheet."""
         from src.mcp.servers.tasks.robotics.turtlebot3.mcp_server import _stitch_panorama
 
         frames = [_make_test_jpeg() for _ in range(4)]
@@ -790,8 +791,7 @@ class TestStitchPanorama:
         with patch.dict('sys.modules', {'cv2': mock_cv2}):
             jpeg_bytes, method = _stitch_panorama(frames, headings)
 
-        # Should have fallen through to heading_strip or grid
-        assert method in ('heading_strip', 'grid_mosaic')
+        assert method == 'contact_sheet'
         assert isinstance(jpeg_bytes, bytes)
 
 
@@ -864,7 +864,7 @@ class TestRotateAndScan:
         assert len(result) == 2
         summary = result[0]
         assert "Captured" in summary
-        assert "Stitch method" in summary
+        assert "Layout" in summary
 
     def test_rotate_and_scan_zero_frames_raises(self, bridge):
         """rotate_and_scan should raise when no frames are captured."""

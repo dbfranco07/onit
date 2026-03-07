@@ -545,229 +545,141 @@ def _build_grid_mosaic(
     return buf.getvalue()
 
 
-def _build_heading_strip(
+def _heading_to_cardinal(deg: float) -> str:
+    """Convert heading degrees to cardinal/intercardinal label."""
+    deg = deg % 360.0
+    dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+    idx = int((deg + 22.5) / 45.0) % 8
+    return dirs[idx]
+
+
+def _build_contact_sheet(
     jpeg_frames: list[bytes],
     headings: list[float],
-    canvas_height: int = 480,
-    hfov: float = _CAMERA_HFOV_DEG,
+    cell_width: int = 400,
+    padding: int = 6,
 ) -> bytes:
-    """Build a panorama by assigning each output column to the nearest frame.
+    """Build an annotated contact-sheet grid from captured frames.
 
-    **Nearest-center compositing** — for every output pixel column the
-    *single* frame whose capture heading is closest is used.  Only a very
-    narrow gradient (``SEAM_PX``) is applied at the boundary between two
-    frames so there are no ghosting / double-exposure artefacts.
+    Each frame is displayed as an individual sharp thumbnail sorted by
+    heading (left-to-right, top-to-bottom) with a prominent label showing
+    the frame number, heading angle, and cardinal direction.
 
-    When the total angular span exceeds 200° the panorama is split into
-    **two rows** (top = first half, bottom = second half) so the VLM
-    receives a more square image with larger visible objects.
+    This avoids all stitching artefacts (seams, ghosting, exposure
+    mismatch) and gives the VLM individually crisp frames it can reason
+    about ("frame [5] at 90° E shows a chair").
 
-    Heading tick marks and per-frame labels are drawn at the top of each
-    row for spatial reference.
+    Grid layout targets a roughly 16:9 aspect ratio.
 
     Returns JPEG bytes.
     """
     import io
     import math
-    import numpy as np
     from PIL import Image as PILImage, ImageDraw, ImageFont
 
     if not jpeg_frames:
-        raise ValueError("No frames to build heading strip from.")
+        raise ValueError("No frames to build contact sheet from.")
 
-    SEAM_PX = 8  # half-width of gradient transition at seams
+    n = len(jpeg_frames)
 
-    # --- Decode images ---
-    images = []
-    for raw in jpeg_frames:
+    # --- Sort frames by heading ---
+    norm_hdg = [(h % 360.0) for h in headings]
+    order = sorted(range(n), key=lambda i: norm_hdg[i])
+    sorted_jpegs = [jpeg_frames[i] for i in order]
+    sorted_hdg = [norm_hdg[i] for i in order]
+
+    # --- Decode & resize thumbnails ---
+    cells = []
+    for raw in sorted_jpegs:
         img = PILImage.open(io.BytesIO(raw))
-        images.append(img)
+        ratio = cell_width / img.width
+        new_h = int(img.height * ratio)
+        img = img.resize((cell_width, new_h), PILImage.LANCZOS)
+        cells.append(img)
 
-    # Normalise headings to [0, 360) and sort left-to-right
-    norm_headings = [(h % 360.0) for h in headings]
-    order = sorted(range(len(norm_headings)), key=lambda i: norm_headings[i])
-    sorted_hdg = [norm_headings[i] for i in order]
-    sorted_imgs = [images[i] for i in order]
+    cell_h = cells[0].height
 
-    n = len(sorted_imgs)
-    span_start = sorted_hdg[0] - hfov / 2.0
-    span_end = sorted_hdg[-1] + hfov / 2.0
-    total_span = max(span_end - span_start, hfov)
+    # --- Pick grid dimensions targeting ~16:9 ---
+    # Try different column counts and pick the one closest to 16:9
+    best_cols = max(1, math.ceil(math.sqrt(n)))
+    best_ratio_err = float('inf')
+    for c in range(max(1, n // 6), min(n + 1, n // 1 + 1)):
+        r = math.ceil(n / c)
+        w = c * (cell_width + padding) + padding
+        h = r * (cell_h + 30 + padding) + padding  # 30 for label
+        ratio = w / max(h, 1)
+        err = abs(ratio - 16.0 / 9.0)
+        if err < best_ratio_err:
+            best_ratio_err = err
+            best_cols = c
 
-    first_w, first_h = sorted_imgs[0].size
-    px_per_deg = first_w / hfov
-    row_w = int(total_span * px_per_deg)
-    scale_y = canvas_height / first_h
-    frame_w = int(first_w * scale_y)
-    frame_h = canvas_height
+    cols = best_cols
+    rows = math.ceil(n / cols)
 
-    # --- Resize all frames once ---
-    resized_arrs = []
-    for img in sorted_imgs:
-        resized_arrs.append(np.array(
-            img.resize((frame_w, frame_h), PILImage.LANCZOS), dtype=np.uint8
-        ))
-
-    # --- Build single-row strip via nearest-center ---
-    def _compose_strip(strip_w, strip_hdg, strip_arrs, strip_order, s_start):
-        """Compose one horizontal strip.  Returns (uint8 array, draw-info)."""
-        out = np.zeros((frame_h, strip_w, 3), dtype=np.uint8)
-        m = len(strip_hdg)
-        if m == 0:
-            return out, []
-
-        # For each output column, find nearest frame
-        col_headings = np.linspace(s_start, s_start + strip_w / px_per_deg, strip_w)
-        hdg_arr = np.array(strip_hdg)
-        # |col_heading - frame_heading| → shape (strip_w, m)
-        diffs = np.abs(col_headings[:, None] - hdg_arr[None, :])
-        nearest = np.argmin(diffs, axis=1)  # index into strip arrays
-
-        # Vector lookup: for each column, copy from the correct frame
-        for fi in range(m):
-            cols = np.where(nearest == fi)[0]
-            if len(cols) == 0:
-                continue
-            centre_px = int((strip_hdg[fi] - s_start) * px_per_deg)
-            for c in cols:
-                src_x = int((c - centre_px) + frame_w // 2)
-                src_x = max(0, min(frame_w - 1, src_x))
-                out[:, c, :] = strip_arrs[fi][:, src_x, :]
-
-        # Apply narrow seam blending at frame boundaries
-        boundary_cols = []
-        for c in range(1, strip_w):
-            if nearest[c] != nearest[c - 1]:
-                boundary_cols.append(c)
-
-        for bc in boundary_cols:
-            fi_left = nearest[max(0, bc - 1)]
-            fi_right = nearest[min(strip_w - 1, bc)]
-            blend_start = max(0, bc - SEAM_PX)
-            blend_end = min(strip_w, bc + SEAM_PX)
-            for bx in range(blend_start, blend_end):
-                alpha = (bx - blend_start) / max(1, blend_end - blend_start - 1)
-                # Get pixels from both frames
-                cx_l = int((bx - int((strip_hdg[fi_left] - s_start) * px_per_deg)) + frame_w // 2)
-                cx_r = int((bx - int((strip_hdg[fi_right] - s_start) * px_per_deg)) + frame_w // 2)
-                cx_l = max(0, min(frame_w - 1, cx_l))
-                cx_r = max(0, min(frame_w - 1, cx_r))
-                pix_l = strip_arrs[fi_left][:, cx_l, :].astype(np.float32)
-                pix_r = strip_arrs[fi_right][:, cx_r, :].astype(np.float32)
-                out[:, bx, :] = np.clip(pix_l * (1 - alpha) + pix_r * alpha, 0, 255).astype(np.uint8)
-
-        return out, strip_order
-
-    # --- Decide layout: 1 row or 2 rows ---
-    use_two_rows = total_span > 200.0 and n >= 6
     label_h = 30
+    total_cell_h = cell_h + label_h
+    sheet_w = cols * (cell_width + padding) + padding
+    sheet_h = rows * (total_cell_h + padding) + padding
+
+    sheet = PILImage.new("RGB", (sheet_w, sheet_h), color=(30, 30, 30))
+    draw = ImageDraw.Draw(sheet)
 
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
-        font_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        font_sm = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
     except Exception:
         font = ImageFont.load_default()
         font_sm = font
 
-    if use_two_rows:
-        mid = n // 2
-        # Row 1: first half of frames
-        r1_hdg = sorted_hdg[:mid]
-        r1_arrs = resized_arrs[:mid]
-        r1_order = order[:mid]
-        r1_start = r1_hdg[0] - hfov / 2.0
-        r1_end = r1_hdg[-1] + hfov / 2.0
-        r1_w = int((r1_end - r1_start) * px_per_deg)
+    for idx in range(n):
+        col = idx % cols
+        row = idx // cols
+        x = padding + col * (cell_width + padding)
+        y = padding + row * (total_cell_h + padding)
 
-        # Row 2: second half of frames
-        r2_hdg = sorted_hdg[mid:]
-        r2_arrs = resized_arrs[mid:]
-        r2_order = order[mid:]
-        r2_start = r2_hdg[0] - hfov / 2.0
-        r2_end = r2_hdg[-1] + hfov / 2.0
-        r2_w = int((r2_end - r2_start) * px_per_deg)
+        # Label bar background
+        draw.rectangle(
+            [x, y, x + cell_width, y + label_h], fill=(50, 50, 60))
 
-        canvas_w = max(r1_w, r2_w)
-        canvas_h = 2 * (frame_h + label_h)
-        canvas = PILImage.new("RGB", (canvas_w, canvas_h), (30, 30, 30))
-        draw = ImageDraw.Draw(canvas)
+        # Frame number + heading + cardinal
+        hdg = sorted_hdg[idx]
+        orig_idx = order[idx] + 1  # 1-based capture order
+        cardinal = _heading_to_cardinal(hdg)
+        label = f"[{orig_idx}]  {hdg:.0f}°  {cardinal}"
+        draw.text((x + 8, y + 5), label,
+                  fill=(255, 255, 100), font=font)
 
-        # Compose row 1
-        strip1, _ = _compose_strip(r1_w, r1_hdg, r1_arrs, r1_order, r1_start)
-        canvas.paste(PILImage.fromarray(strip1), (0, label_h))
-        _draw_heading_labels(draw, r1_hdg, r1_order, r1_start, r1_end,
-                             px_per_deg, label_h, 0, canvas_w, font, font_sm)
+        # Paste thumbnail
+        sheet.paste(cells[idx], (x, y + label_h))
 
-        # Compose row 2
-        y2 = frame_h + label_h
-        strip2, _ = _compose_strip(r2_w, r2_hdg, r2_arrs, r2_order, r2_start)
-        canvas.paste(PILImage.fromarray(strip2), (0, y2 + label_h))
-        _draw_heading_labels(draw, r2_hdg, r2_order, r2_start, r2_end,
-                             px_per_deg, label_h, y2, canvas_w, font, font_sm)
-    else:
-        # Single row
-        canvas_w = row_w
-        canvas_h = frame_h + label_h
-        canvas = PILImage.new("RGB", (canvas_w, canvas_h), (30, 30, 30))
-        draw = ImageDraw.Draw(canvas)
-
-        strip, _ = _compose_strip(row_w, sorted_hdg, resized_arrs, order, span_start)
-        canvas.paste(PILImage.fromarray(strip), (0, label_h))
-        _draw_heading_labels(draw, sorted_hdg, order, span_start, span_end,
-                             px_per_deg, label_h, 0, canvas_w, font, font_sm)
+        # Thin border around cell
+        draw.rectangle(
+            [x - 1, y - 1, x + cell_width + 1, y + total_cell_h + 1],
+            outline=(80, 80, 80), width=1)
 
     buf = io.BytesIO()
-    canvas.save(buf, format="JPEG", quality=90)
+    sheet.save(buf, format="JPEG", quality=90)
     return buf.getvalue()
-
-
-def _draw_heading_labels(draw, sorted_hdg, order, span_start, span_end,
-                         px_per_deg, label_h, y_offset, canvas_w, font, font_sm):
-    """Draw heading ticks and frame markers for one panorama row."""
-    import math
-
-    # Background bar
-    draw.rectangle([(0, y_offset), (canvas_w, y_offset + label_h)],
-                   fill=(20, 20, 20))
-
-    # Degree ticks every 30°
-    tick_interval = 30.0
-    tick = math.ceil(span_start / tick_interval) * tick_interval
-    while tick <= span_end:
-        tx = int((tick - span_start) * px_per_deg)
-        if 0 <= tx < canvas_w:
-            draw.line([(tx, y_offset + label_h - 8), (tx, y_offset + label_h)],
-                      fill=(200, 200, 200), width=2)
-            draw.text((tx + 3, y_offset + 2), f"{tick % 360:.0f}°",
-                      fill=(255, 255, 100), font=font)
-        tick += tick_interval
-
-    # Frame markers
-    for idx, hdg in enumerate(sorted_hdg):
-        tx = int((hdg - span_start) * px_per_deg)
-        if 0 <= tx < canvas_w:
-            draw.line([(tx, y_offset + label_h - 12), (tx, y_offset + label_h)],
-                      fill=(100, 255, 100), width=2)
-            draw.text((tx + 3, y_offset + 14), f"[{order[idx]+1}]",
-                      fill=(100, 255, 100), font=font_sm)
 
 
 def _stitch_panorama(
     jpeg_frames: list[bytes],
     headings: list[float],
 ) -> tuple[bytes, str]:
-    """Build a 360° panoramic image from ordered camera frames.
+    """Build a 360° survey image from ordered camera frames.
 
-    Strategy (hybrid):
+    Strategy:
       1. **OpenCV Stitcher** — feature-based homography + multi-band blend.
-         Produces the best result when sufficient texture is present.
-      2. **Heading-based strip** — cylindrical projection using odometry.
-         Always works; no feature matching required.
-      3. **Grid mosaic** — labeled thumbnail grid (last resort).
+         Produces a seamless panorama when sufficient texture is present.
+      2. **Contact sheet** — annotated grid of individually sharp frames
+         sorted by heading.  Always works, no artefacts, and the VLM can
+         reason about each frame independently.
 
     Returns:
         ``(jpeg_bytes, method)`` where *method* is one of
-        ``'opencv_stitcher'``, ``'heading_strip'``, or ``'grid_mosaic'``.
+        ``'opencv_stitcher'`` or ``'contact_sheet'``.
     """
     import io
     import numpy as np
@@ -790,7 +702,6 @@ def _stitch_panorama(
             stitcher = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
             status, pano = stitcher.stitch(cv_images)
             if status == cv2.Stitcher_OK and pano is not None:
-                # Encode result as JPEG
                 _, buf = cv2.imencode('.jpg', pano, [cv2.IMWRITE_JPEG_QUALITY, 90])
                 _stderr(f"OpenCV stitcher succeeded: {pano.shape[1]}×{pano.shape[0]}")
                 return buf.tobytes(), 'opencv_stitcher'
@@ -801,17 +712,10 @@ def _stitch_panorama(
     except Exception as exc:
         _stderr(f"OpenCV stitcher failed: {exc} — falling back")
 
-    # --- Attempt 2: Heading-based cylindrical strip ---
-    try:
-        result = _build_heading_strip(jpeg_frames, headings)
-        _stderr("Heading-based strip succeeded")
-        return result, 'heading_strip'
-    except Exception as exc:
-        _stderr(f"Heading strip failed: {exc} — falling back to grid")
-
-    # --- Attempt 3: Grid mosaic (always works) ---
-    result = _build_grid_mosaic(jpeg_frames, headings)
-    return result, 'grid_mosaic'
+    # --- Attempt 2: Contact sheet (always works) ---
+    result = _build_contact_sheet(jpeg_frames, headings)
+    _stderr("Contact sheet built successfully")
+    return result, 'contact_sheet'
 
 
 # =========================================================================
@@ -819,21 +723,22 @@ def _stitch_panorama(
 # =========================================================================
 
 @mcp.tool(
-    title="Rotate and Scan (panoramic)",
+    title="Rotate and Scan (360° survey)",
     description=(
-        "Perform a full 360° rotation and return a SINGLE stitched panoramic "
-        "image of the entire surroundings.  The panorama is built by capturing "
-        "frames at regular intervals and stitching them into one continuous "
-        "wide image — NOT a grid of thumbnails.\n\n"
-        "This is the **PRIMARY tool for search tasks**: one call gives the "
-        "VLM a complete 360° view of the environment in a single image so "
-        "nothing is missed.  Use it as Step 1 whenever you need to find or "
-        "survey something.\n\n"
-        "Stitching pipeline: OpenCV feature-based stitcher → heading-based "
-        "cylindrical strip (fallback) → grid mosaic (last resort).\n\n"
+        "Perform a full 360° rotation and return a SINGLE image surveying "
+        "the entire surroundings.  Frames are captured at regular angular "
+        "steps and assembled into an annotated contact-sheet grid sorted "
+        "by heading — each frame is individually sharp and labelled with "
+        "its heading and cardinal direction.\n\n"
+        "This is the **PRIMARY tool for search tasks**: one call gives   "
+        "a complete 360° view of the environment so nothing is missed. "
+        "Use it as Step 1 whenever you need to find or survey something."
+        "\n\n"
+        "Pipeline: tries OpenCV feature-based panorama first; falls back "
+        "to the contact-sheet grid (no stitching artefacts).\n\n"
         "Defaults: 360° sweep in 24° steps (= 15 frames with ~38° overlap "
-        "given the 62° camera FOV). Negative total_angle sweeps clockwise.\n\n"
-        "Returns: a text summary + ONE panoramic JPEG."
+        "given the 62° camera FOV). Negative total_angle sweeps clockwise."
+        "\n\nReturns: a text summary + ONE survey image."
     ),
 )
 def rotate_and_scan(
@@ -957,20 +862,21 @@ def rotate_and_scan(
     swept_deg = _math.degrees(sweep_accumulated_rad)
     method_desc = {
         'opencv_stitcher': 'seamless feature-based panorama',
-        'heading_strip': 'heading-based cylindrical panorama',
-        'grid_mosaic': 'labeled grid mosaic (stitching unavailable)',
+        'contact_sheet': 'annotated contact-sheet grid',
     }.get(stitch_method, stitch_method)
 
     summary = (
         f"Captured {len(raw_frames)} frames over a {swept_deg:.0f}° sweep "
         f"({step_abs:.0f}° steps, {direction_label}).\n"
-        f"Stitch method: {method_desc}.\n"
+        f"Layout: {method_desc}.\n"
         f"Headings (deg): {headings}\n\n"
-        "The attached panoramic image shows a CONTINUOUS 360° view of the "
-        "environment.  Scan the ENTIRE image from left to right — objects "
-        "appear at their true heading positions.  If the target is visible, "
-        "report its approximate heading (degrees) based on the tick marks "
-        "at the top of the image and describe what you see."
+        "The attached image is a CONTACT SHEET — a grid of individually "
+        "sharp frames sorted by heading (left-to-right, top-to-bottom).  "
+        "Each frame is labelled with its capture-order number [N], heading "
+        "in degrees, and cardinal direction (N/NE/E/SE/S/SW/W/NW).\n\n"
+        "Examine EVERY frame carefully.  If the target is visible, report "
+        "which frame number [N] it appears in, the heading, and describe "
+        "what you see.  If not visible, say so."
     )
 
     return [summary, pano_image]

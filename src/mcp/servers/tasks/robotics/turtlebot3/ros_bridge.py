@@ -851,17 +851,16 @@ class TurtleBot3Bridge:
         _stderr("Search frames cleared")
 
     def _rebuild_mosaic_from_frames(self, frames: list[tuple[bytes, float]]):
-        """Build a progressive panoramic strip from accumulated frames.
+        """Build a progressive contact-sheet grid from accumulated frames.
 
-        Uses heading-based placement (fast, no feature matching) so the
-        operator sees a growing panorama in the web viewer as the robot
-        rotates.  Falls back to a simple grid if fewer than 2 frames are
-        available.
+        Each frame is displayed as a sharp, individually labelled thumbnail
+        sorted by heading — the operator sees the grid grow in the web
+        viewer as the robot rotates.  No stitching is attempted, avoiding
+        all seam / ghosting artefacts.
         """
         try:
             from PIL import Image, ImageDraw, ImageFont
-            import io, math, datetime
-            import numpy as np
+            import io, math
 
             images = []
             headings = []
@@ -873,108 +872,81 @@ class TurtleBot3Bridge:
             if not images:
                 return
 
-            # With only 1 frame, just show it with a heading label
-            if len(images) < 2:
-                cw, ch = images[0].size
-                scale = min(1.0, 480 / ch)
-                cw_s, ch_s = int(cw * scale), int(ch * scale)
-                label_h = 22
-                canvas = Image.new("RGB", (cw_s, ch_s + label_h), (30, 30, 30))
-                thumb = images[0].resize((cw_s, ch_s), Image.LANCZOS)
-                canvas.paste(thumb, (0, label_h))
-                draw = ImageDraw.Draw(canvas)
-                try:
-                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
-                except Exception:
-                    font = ImageFont.load_default()
-                draw.text((4, 2), f"[1] {headings[0]:.0f}°", fill=(255, 255, 100), font=font)
-                buf = io.BytesIO()
-                canvas.save(buf, format="JPEG", quality=85)
-                self.set_mosaic(buf.getvalue())
-                return
+            n = len(images)
 
-            # --- Heading-based panoramic strip ---
-            HFOV = 62.0  # camera horizontal FOV in degrees
-            CANVAS_H = 480
+            # Heading → cardinal helper
+            _DIRS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+            def _cardinal(d):
+                return _DIRS[int((d % 360.0 + 22.5) / 45.0) % 8]
 
-            # Normalise headings to [0, 360) and sort by heading
+            # Sort by heading
             norm_hdg = [(h % 360.0) for h in headings]
-            order = sorted(range(len(norm_hdg)), key=lambda i: norm_hdg[i])
-            sorted_hdg = [norm_hdg[i] for i in order]
+            order = sorted(range(n), key=lambda i: norm_hdg[i])
             sorted_imgs = [images[i] for i in order]
+            sorted_hdg = [norm_hdg[i] for i in order]
 
-            span_start = sorted_hdg[0] - HFOV / 2.0
-            span_end = sorted_hdg[-1] + HFOV / 2.0
-            total_span = max(span_end - span_start, HFOV)
+            # Thumbnail sizing
+            CELL_W = 400
+            first_ratio = sorted_imgs[0].height / max(sorted_imgs[0].width, 1)
+            cell_h = int(CELL_W * first_ratio)
+            PADDING = 6
+            LABEL_H = 30
 
-            first_w, first_h = sorted_imgs[0].size
-            px_per_deg = first_w / HFOV
-            canvas_w = int(total_span * px_per_deg)
-            scale_y = CANVAS_H / first_h
-            frame_w = int(first_w * scale_y)
-            frame_h = CANVAS_H
+            # Grid dimensions targeting ~16:9
+            best_cols = max(1, math.ceil(math.sqrt(n)))
+            best_err = float('inf')
+            for c in range(max(1, n // 6), n + 1):
+                r = math.ceil(n / c)
+                w = c * (CELL_W + PADDING) + PADDING
+                h = r * (cell_h + LABEL_H + PADDING) + PADDING
+                err = abs(w / max(h, 1) - 16.0 / 9.0)
+                if err < best_err:
+                    best_err = err
+                    best_cols = c
+            cols = best_cols
+            rows = math.ceil(n / cols)
 
-            label_h = 24
-            canvas = Image.new("RGB", (canvas_w, frame_h + label_h), (30, 30, 30))
-            acc = np.zeros((frame_h, canvas_w, 3), dtype=np.float64)
-            weight = np.zeros((frame_h, canvas_w), dtype=np.float64)
+            sheet_w = cols * (CELL_W + PADDING) + PADDING
+            sheet_h = rows * (cell_h + LABEL_H + PADDING) + PADDING
+            sheet = Image.new("RGB", (sheet_w, sheet_h), (30, 30, 30))
+            draw = ImageDraw.Draw(sheet)
 
-            for img, hdg in zip(sorted_imgs, sorted_hdg):
-                resized = img.resize((frame_w, frame_h), Image.LANCZOS)
-                arr = np.array(resized, dtype=np.float64)
-                centre_x = int((hdg - span_start) * px_per_deg)
-                x0 = centre_x - frame_w // 2
-                x1 = x0 + frame_w
-                src_x0 = max(0, -x0)
-                src_x1 = frame_w - max(0, x1 - canvas_w)
-                dst_x0 = max(0, x0)
-                dst_x1 = min(canvas_w, x1)
-                if dst_x1 <= dst_x0:
-                    continue
-                strip_w = src_x1 - src_x0
-                blend = np.linspace(0, 1, strip_w // 2 + 1)
-                blend = np.concatenate([blend, blend[-2::-1]])
-                if len(blend) < strip_w:
-                    blend = np.append(blend, blend[-1:])
-                blend = blend[:strip_w]
-                blend = np.clip(blend, 0.05, 1.0)
-                acc[:, dst_x0:dst_x1, :] += arr[:, src_x0:src_x1, :] * blend[np.newaxis, :, np.newaxis]
-                weight[:, dst_x0:dst_x1] += blend[np.newaxis, :]
-
-            weight_mask = weight > 0
-            for c in range(3):
-                acc[:, :, c][weight_mask] /= weight[weight_mask]
-            strip_arr = np.clip(acc, 0, 255).astype(np.uint8)
-            strip_img = Image.fromarray(strip_arr)
-            canvas.paste(strip_img, (0, label_h))
-
-            # Draw heading ticks
-            draw = ImageDraw.Draw(canvas)
             try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+                font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
             except Exception:
                 font = ImageFont.load_default()
 
-            tick_interval = 30.0
-            tick_start = math.ceil(span_start / tick_interval) * tick_interval
-            tick = tick_start
-            while tick <= span_end:
-                tx = int((tick - span_start) * px_per_deg)
-                if 0 <= tx < canvas_w:
-                    draw.line([(tx, label_h - 6), (tx, label_h)], fill=(200, 200, 200), width=1)
-                    draw.text((tx + 2, 2), f"{tick % 360:.0f}°", fill=(255, 255, 100), font=font)
-                tick += tick_interval
+            for idx in range(n):
+                col = idx % cols
+                row = idx // cols
+                x = PADDING + col * (CELL_W + PADDING)
+                y = PADDING + row * (cell_h + LABEL_H + PADDING)
 
-            for idx, hdg in enumerate(sorted_hdg):
-                tx = int((hdg - span_start) * px_per_deg)
-                if 0 <= tx < canvas_w:
-                    draw.line([(tx, label_h - 10), (tx, label_h)], fill=(100, 255, 100), width=2)
+                # Label bar
+                draw.rectangle(
+                    [x, y, x + CELL_W, y + LABEL_H], fill=(50, 50, 60))
+                hdg = sorted_hdg[idx]
+                orig_idx = order[idx] + 1
+                label = f"[{orig_idx}]  {hdg:.0f}°  {_cardinal(hdg)}"
+                draw.text((x + 8, y + 5), label,
+                          fill=(255, 255, 100), font=font)
+
+                # Thumbnail
+                thumb = sorted_imgs[idx].resize(
+                    (CELL_W, cell_h), Image.LANCZOS)
+                sheet.paste(thumb, (x, y + LABEL_H))
+
+                # Border
+                draw.rectangle(
+                    [x - 1, y - 1, x + CELL_W + 1, y + cell_h + LABEL_H + 1],
+                    outline=(80, 80, 80), width=1)
 
             buf = io.BytesIO()
-            canvas.save(buf, format="JPEG", quality=85)
+            sheet.save(buf, format="JPEG", quality=85)
             self.set_mosaic(buf.getvalue())
         except Exception as exc:
-            _stderr(f"WARNING: panoramic strip rebuild failed: {exc}")
+            _stderr(f"WARNING: contact sheet rebuild failed: {exc}")
 
     @property
     def camera_viewer_url(self):
