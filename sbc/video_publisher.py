@@ -3,6 +3,12 @@
 Video Publisher Node — runs on TurtleBot3
 Subscribes to raw camera images from camera_ros,
 compresses them as JPEG, and re-publishes as CompressedImage.
+
+Optimisations for VLM agent comprehension:
+  - Higher JPEG quality (default 80) for clearer object edges
+  - Adaptive resize to consistent width (default 640) for bandwidth control
+  - Optional CLAHE contrast enhancement for low-light lab environments
+  - Configurable publish FPS to reduce bandwidth without dropping subscription
 """
 
 import rclpy
@@ -10,14 +16,30 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, CompressedImage
 import cv2
 import numpy as np
+import time
 
 
 class VideoPublisher(Node):
     def __init__(self):
         super().__init__('video_publisher')
 
-        self.declare_parameter('jpeg_quality', 50)
+        # --- Configurable parameters ---
+        self.declare_parameter('jpeg_quality', 80)
+        self.declare_parameter('target_width', 640)
+        self.declare_parameter('enhance_contrast', True)
+        self.declare_parameter('publish_fps', 15.0)
+
         self.jpeg_quality = self.get_parameter('jpeg_quality').value
+        self.target_width = self.get_parameter('target_width').value
+        self.enhance_contrast = self.get_parameter('enhance_contrast').value
+        self.publish_fps = self.get_parameter('publish_fps').value
+
+        # Frame-rate gating
+        self._min_publish_interval = 1.0 / max(self.publish_fps, 1.0)
+        self._last_publish_time = 0.0
+
+        # CLAHE instance (reused across frames for efficiency)
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
         # Subscribe to raw images from camera_ros
         self.subscription = self.create_subscription(
@@ -35,25 +57,58 @@ class VideoPublisher(Node):
         )
 
         self.frame_count = 0
-        self.get_logger().info('Video publisher started — subscribing to /camera/image_raw, publishing to /camera/image/compressed')
+        self.publish_count = 0
+        self.get_logger().info(
+            f'Video publisher started — quality={self.jpeg_quality}, '
+            f'target_width={self.target_width}, enhance_contrast={self.enhance_contrast}, '
+            f'publish_fps={self.publish_fps}'
+        )
 
     def image_callback(self, msg):
+        # Frame-rate gating: skip if publishing too fast
+        now = time.monotonic()
+        if (now - self._last_publish_time) < self._min_publish_interval:
+            return
+
         # Convert ROS Image to numpy array
         try:
-            if msg.encoding == 'bgr8' or msg.encoding == 'BGR888':
-                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-            elif msg.encoding == 'rgb8' or msg.encoding == 'RGB888':
-                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+            if msg.encoding in ('bgr8', 'BGR888'):
+                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+                    msg.height, msg.width, 3
+                )
+            elif msg.encoding in ('rgb8', 'RGB888'):
+                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+                    msg.height, msg.width, 3
+                )
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             else:
                 # Try to handle other formats via cv_bridge-style conversion
-                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
+                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+                    msg.height, msg.width, -1
+                )
         except Exception as e:
             self.get_logger().warn(f'Failed to convert image: {e}')
             return
 
-
+        # Rotate (camera is mounted sideways on the TurtleBot3)
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+
+        # Adaptive resize: scale to target_width while preserving aspect ratio
+        h, w = frame.shape[:2]
+        if self.target_width > 0 and w != self.target_width:
+            scale = self.target_width / w
+            new_w = self.target_width
+            new_h = int(h * scale)
+            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        # CLAHE contrast enhancement (helps in low-light / uneven lab lighting)
+        if self.enhance_contrast:
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l_ch, a_ch, b_ch = cv2.split(lab)
+            l_ch = self._clahe.apply(l_ch)
+            lab = cv2.merge([l_ch, a_ch, b_ch])
+            frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
         # Encode as JPEG
         encode_params = [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
         _, encoded = cv2.imencode('.jpg', frame, encode_params)
@@ -65,9 +120,14 @@ class VideoPublisher(Node):
         comp_msg.data = encoded.tobytes()
         self.publisher.publish(comp_msg)
 
+        self._last_publish_time = now
         self.frame_count += 1
-        if self.frame_count % 30 == 0:
-            self.get_logger().info(f'Published {self.frame_count} compressed frames')
+        self.publish_count += 1
+        if self.publish_count % 30 == 0:
+            self.get_logger().info(
+                f'Published {self.publish_count} frames '
+                f'(received {self.frame_count}, {len(encoded)} bytes/frame)'
+            )
 
 
 def main(args=None):

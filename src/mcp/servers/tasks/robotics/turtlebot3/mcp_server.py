@@ -1,18 +1,20 @@
 """
 TurtleBot3 MCP Server — sensor and motion tools for a TurtleBot3 robot via ROS 2.
 
-8 Core Tools:
+10 Core Tools:
   Sensors:
     1. get_camera_image    — Capture latest camera frame (returns ImageContent for VLMs)
     2. get_lidar_scan      — Latest 360° LiDAR scan (ranges, angles, limits)
     3. get_odometry        — Current pose & velocity (dead reckoning)
+    4. check_path_clear    — Quick lidar check if a direction is obstacle-free
   Motion:
-    4. move_forward        — Drive forward N metres
-    5. turn                — Rotate N degrees
-    6. stop                — Emergency stop
+    5. move_forward        — Drive forward N metres (lidar-guarded, smooth ramping)
+    6. turn                — Rotate N degrees (smooth ramping)
+    7. navigate_safely     — Move forward with automatic obstacle avoidance
+    8. stop                — Emergency stop
   Utility:
-    7. open_camera_viewer  — Open live MJPEG camera stream in browser
-    8. diagnose_ros        — ROS 2 connectivity diagnostics
+    9. open_camera_viewer  — Open live MJPEG camera stream in browser
+   10. diagnose_ros        — ROS 2 connectivity diagnostics
 
 Designed for TurtleBot3 Burger on ROS 2 Humble.
 """
@@ -58,18 +60,21 @@ def _get_bridge():
 @mcp.tool(
     title="Get Camera Image",
     description=(
-        "Capture the latest camera frame from the TurtleBot3. "
+        "Capture a FRESH camera frame from the TurtleBot3. "
+        "Waits for a new frame to arrive (up to 1 s) so the image is never "
+        "stale or motion-blurred from a recent turn. "
         "Returns a JPEG image that can be analysed by a vision-language model. "
         "Use this tool when asked to describe surroundings or identify objects."
     ),
 )
 def get_camera_image() -> Image:
-    """Return the latest compressed camera image as ImageContent."""
+    """Return a fresh compressed camera image as ImageContent."""
     bridge = _get_bridge()
-    image_bytes, timestamp = bridge.get_image()
+    # wait_for_fresh_frame blocks until a frame newer than the current
+    # cached one arrives, avoiding stale / motion-blurred images.
+    image_bytes, timestamp = bridge.wait_for_fresh_frame(timeout=1.0)
 
     if image_bytes is None:
-        # Return a text error — FastMCP will wrap it correctly
         raise ValueError(
             "No camera image available yet. The camera may not be publishing, "
             "or no frame has been received. Check that the camera node is running "
@@ -255,6 +260,77 @@ def stop() -> str:
 
 
 # =========================================================================
+# LIDAR NAVIGATION TOOLS
+# =========================================================================
+
+@mcp.tool(
+    title="Check Path Clear",
+    description=(
+        "Quick lidar check whether a direction is free of obstacles. "
+        "Returns whether the path is clear and the minimum distance to the "
+        "nearest object. Use this before moving to verify safety, or to "
+        "decide which direction to turn when the front path is blocked."
+    ),
+)
+def check_path_clear(
+    direction: str = "front",
+    threshold_m: float = 0.3,
+) -> str:
+    """Check if a direction is obstacle-free.
+
+    Args:
+        direction: Direction to check — 'front', 'left', 'right', or 'back'.
+        threshold_m: Distance threshold in metres. If closest obstacle is
+            nearer than this, the path is not clear. Default 0.3 m.
+    """
+    if direction not in ("front", "left", "right", "back"):
+        return json.dumps({
+            "error": f"Invalid direction '{direction}'. Use front/left/right/back.",
+        })
+
+    bridge = _get_bridge()
+    result = bridge.check_path_clear(direction=direction, threshold_m=threshold_m)
+    return json.dumps(result, indent=2, default=_json_default)
+
+
+@mcp.tool(
+    title="Navigate Safely",
+    description=(
+        "Move the TurtleBot3 forward with integrated lidar obstacle avoidance. "
+        "Unlike plain move_forward, this tool automatically checks the path "
+        "and attempts corrective turns if an obstacle is detected. Use this "
+        "when navigating through cluttered environments (desks, chairs, cables). "
+        "Default speed is 0.15 m/s (slightly slower for safety). "
+        "Returns details about the path taken, including any corrections."
+    ),
+)
+def navigate_safely(
+    distance: float = 0.5,
+    speed: float = 0.15,
+    obstacle_threshold_m: float = 0.3,
+) -> str:
+    """Navigate forward with automatic obstacle avoidance.
+
+    Args:
+        distance: Distance to travel in metres (positive). Default 0.5 m.
+        speed: Linear speed in m/s (0 < speed ≤ 0.22). Default 0.15 m/s.
+        obstacle_threshold_m: Stop/correct if obstacle closer than this. Default 0.3 m.
+    """
+    if distance <= 0:
+        return json.dumps({"error": "Distance must be positive.", "status": "failed"})
+    if speed <= 0:
+        return json.dumps({"error": "Speed must be positive.", "status": "failed"})
+
+    bridge = _get_bridge()
+    result = bridge.navigate_safely(
+        distance_m=distance,
+        speed=speed,
+        obstacle_threshold_m=obstacle_threshold_m,
+    )
+    return json.dumps(result, indent=2, default=_json_default)
+
+
+# =========================================================================
 # CAMERA VIEWER TOOL
 # =========================================================================
 
@@ -382,6 +458,90 @@ def diagnose_ros() -> str:
 
 
 # =========================================================================
+# ROTATE AND SCAN TOOL
+# =========================================================================
+
+@mcp.tool(
+    title="Rotate and Scan",
+    description=(
+        "Slowly rotate the robot while capturing a stable camera frame at "
+        "every step. Returns ALL captured frames so you can examine them in "
+        "one go. This is far more reliable than issuing individual turn + "
+        "get_camera_image calls because it guarantees a settling delay and "
+        "a fresh (non-blurred) frame at every heading.\n\n"
+        "Use this for 'find object' / search tasks instead of manual loops.\n\n"
+        "Defaults: 360° sweep in 30° steps (= 12 frames with ~32° overlap "
+        "given the 62° camera FOV).  Negative total_angle sweeps clockwise."
+    ),
+)
+def rotate_and_scan(
+    total_angle: float = 360.0,
+    step_angle: float = 30.0,
+    settle_time: float = 0.3,
+    speed: float = 0.3,
+) -> list:
+    """Rotate and capture camera frames at each step.
+
+    Args:
+        total_angle: Total rotation in degrees (positive=CCW, negative=CW).
+                     Default 360° for a full sweep.
+        step_angle:  Degrees per step.  Default 30° (12 steps for 360°).
+        settle_time: Seconds to wait after each step for the robot to
+                     decelerate and the camera to publish a stable frame.
+                     Default 0.3 s.
+        speed:       Angular speed in rad/s.  Default 0.3 rad/s.
+    """
+    import time as _time
+
+    bridge = _get_bridge()
+
+    direction = -1.0 if total_angle >= 0 else 1.0   # default sweep = CW
+    total_abs = abs(total_angle)
+    step_abs = abs(step_angle)
+    steps = max(1, int(round(total_abs / step_abs)))
+
+    frames = []  # list[Image]
+    headings = []  # list[float] — yaw in degrees at each capture
+
+    for i in range(steps):
+        # Turn one step
+        bridge.turn(angle_deg=direction * step_abs, angular_speed=speed)
+
+        # Extra settle time (on top of the 0.3 s inside turn())
+        if settle_time > 0:
+            _time.sleep(settle_time)
+
+        # Wait for a genuinely fresh frame
+        image_bytes, timestamp = bridge.wait_for_fresh_frame(timeout=1.0)
+
+        if image_bytes is not None:
+            frames.append(Image(data=image_bytes, format="jpeg"))
+
+        # Record heading for the summary
+        odom = bridge.get_odom()
+        if odom:
+            headings.append(round(odom["orientation_yaw_deg"], 1))
+
+    if not frames:
+        raise ValueError(
+            "rotate_and_scan captured 0 frames. "
+            "Is the camera node running?"
+        )
+
+    # Return images directly — FastMCP serialises the list for the VLM.
+    # Also prepend a text summary so the model knows which heading each
+    # image corresponds to.
+    summary = (
+        f"Captured {len(frames)} frames over a {total_abs}° sweep "
+        f"({step_abs}° steps, {'CCW' if direction == 1.0 else 'CW'}).\n"
+        f"Headings (deg): {headings}\n"
+        "Examine each image carefully for the target object."
+    )
+    # FastMCP allows returning mixed content; put text first, then images
+    return [summary] + frames
+
+
+# =========================================================================
 # HELPERS
 # =========================================================================
 
@@ -492,8 +652,8 @@ def run(
 
     logger.info(f"Starting TurtleBot3 MCP Server at {host}:{port}{path}")
     logger.info(
-        "8 Tools: get_camera_image, get_lidar_scan, get_odometry, "
-        "move_forward, turn, stop, open_camera_viewer, diagnose_ros"
+        "10 Tools: get_camera_image, get_lidar_scan, get_odometry, check_path_clear, "
+        "move_forward, turn, navigate_safely, stop, open_camera_viewer, diagnose_ros"
     )
 
     if not verbose:

@@ -75,17 +75,32 @@ class MotionServiceServer(Node):
         return response
 
     def _execute_motion(self, linear_x, angular_z, duration):
-        """Publish velocity for the specified duration, then stop."""
-        twist = Twist()
-        twist.linear.x = linear_x
-        twist.angular.z = angular_z
-
-        rate = 10  # Hz
+        """Publish velocity for the specified duration with trapezoidal ramping."""
+        rate = 20  # Hz — tighter control loop for smoother motion
+        dt = 1.0 / rate
         steps = int(duration * rate)
+        ramp_steps = max(1, int(0.15 * steps))  # 15% of duration for ramp
 
-        for _ in range(steps):
+        for i in range(steps):
+            # Trapezoidal envelope: ramp up, cruise, ramp down
+            if i < ramp_steps:
+                # Ramp up
+                frac = (i + 1) / ramp_steps
+            elif i >= steps - ramp_steps:
+                # Ramp down
+                frac = (steps - i) / ramp_steps
+            else:
+                # Cruise
+                frac = 1.0
+
+            # Clamp fraction and apply minimum floor to avoid stalling
+            frac = max(0.15, min(1.0, frac))
+
+            twist = Twist()
+            twist.linear.x = linear_x * frac
+            twist.angular.z = angular_z * frac
             self.cmd_vel_pub.publish(twist)
-            time.sleep(1.0 / rate)
+            time.sleep(dt)
 
         # Stop the robot
         stop_twist = Twist()

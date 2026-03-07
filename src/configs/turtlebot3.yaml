@@ -23,6 +23,10 @@ session_path: "~/.onit/sessions"
 
 template_path: src/mcp/prompts/prompt_templates/assistant_robotics.yaml
 
+# Enable A2A server mode so `onit --config ...` starts the A2A server
+# on port 9001.  Clients connect via: onit --a2a-client --a2a-task "..."
+a2a: true
+
 # Timeout per tool call (seconds). Motion commands may take a while.
 timeout: 60
 

@@ -38,8 +38,17 @@ MAX_ANGULAR_SPEED = 2.84  # rad/s
 # Default timeout for motion commands
 DEFAULT_MOTION_TIMEOUT = 30.0  # seconds
 
-# Default control loop rate
-CONTROL_HZ = 10  # Hz
+# Control loop rate — 20 Hz gives tighter feedback and smoother ramping
+CONTROL_HZ = 20  # Hz
+
+# Trapezoidal velocity profile parameters
+LINEAR_RAMP_DISTANCE = 0.05   # metres — ramp over first/last 5 cm
+ANGULAR_RAMP_DEG = 5.0        # degrees — ramp over first/last 5°
+MIN_LINEAR_SPEED = 0.03       # m/s — floor so robot doesn't stall
+MIN_ANGULAR_SPEED = 0.1       # rad/s — floor so robot doesn't stall
+
+# Default obstacle safety margin
+DEFAULT_SAFETY_MARGIN_M = 0.25
 
 # Default camera viewer port
 DEFAULT_VIEWER_PORT = 18280
@@ -53,32 +62,120 @@ _VIEWER_HTML = """
 <html>
 <head>
   <title>TurtleBot3 Camera Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
-      margin: 0; background: #1e1e1e; color: #ccc;
-      font-family: system-ui, sans-serif;
+      background: #111; color: #ddd;
+      font-family: system-ui, -apple-system, sans-serif;
       display: flex; flex-direction: column;
       align-items: center; justify-content: center;
-      min-height: 100vh;
+      min-height: 100vh; padding: 12px;
     }}
-    h1 {{ margin: 16px 0 8px; font-size: 1.3em; color: #eee; }}
-    #status {{ font-size: 0.85em; margin-bottom: 8px; }}
-    img {{
-      max-width: 95vw; max-height: 80vh;
-      border: 2px solid #444; border-radius: 6px;
+    .header {{
+      display: flex; align-items: center; gap: 12px;
+      margin-bottom: 8px; flex-wrap: wrap;
+      justify-content: center;
     }}
+    h1 {{ font-size: 1.2em; color: #fff; white-space: nowrap; }}
+    .stats {{
+      font-size: 0.85em; color: #aaa;
+      display: flex; gap: 16px;
+    }}
+    .stats span {{ white-space: nowrap; }}
+    .controls {{
+      display: flex; gap: 8px; margin-bottom: 10px;
+    }}
+    .controls button {{
+      padding: 6px 14px; border: 1px solid #555;
+      background: #222; color: #ddd; border-radius: 4px;
+      cursor: pointer; font-size: 0.85em;
+    }}
+    .controls button:hover {{ background: #333; border-color: #888; }}
+    .feed-container {{
+      position: relative;
+      width: 100%; max-width: 960px;
+      display: flex; justify-content: center;
+    }}
+    #cam {{
+      width: 100%; max-height: 80vh;
+      object-fit: contain;
+      border: 2px solid #333; border-radius: 6px;
+      image-rendering: auto;
+      background: #000;
+    }}
+    .live-dot {{
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #555; display: inline-block;
+    }}
+    .live-dot.active {{ background: #4caf50; animation: pulse 1.5s infinite; }}
+    @keyframes pulse {{
+      0%, 100% {{ opacity: 1; }}
+      50% {{ opacity: 0.4; }}
+    }}
+    .fullscreen .feed-container {{ max-width: none; }}
+    .fullscreen #cam {{ max-height: 100vh; border: none; border-radius: 0; }}
   </style>
 </head>
 <body>
-  <h1>&#x1F916; TurtleBot3 Camera</h1>
-  <div id="status">Waiting for frames&hellip;</div>
-  <img id="cam" src="/stream" alt="Camera feed" />
+  <div class="header">
+    <h1><span class="live-dot" id="liveDot"></span> TurtleBot3 Camera</h1>
+    <div class="stats">
+      <span id="status">Connecting&hellip;</span>
+      <span id="fps"></span>
+      <span id="res"></span>
+    </div>
+  </div>
+  <div class="controls">
+    <button onclick="takeSnapshot()" title="Save current frame (S)">&#128247; Snapshot</button>
+    <button onclick="toggleFullscreen()" title="Toggle fullscreen (F)">&#x26F6; Fullscreen</button>
+  </div>
+  <div class="feed-container">
+    <img id="cam" src="/stream" alt="Camera feed" />
+  </div>
   <script>
     const img = document.getElementById('cam');
     const st  = document.getElementById('status');
-    let frames = 0;
-    img.onload  = () => {{ frames++; st.textContent = 'Live — frame ' + frames; }};
-    img.onerror = () => {{ st.textContent = 'Stream interrupted — retrying&hellip;'; setTimeout(() => {{ img.src = '/stream?' + Date.now(); }}, 1000); }};
+    const fpsSp = document.getElementById('fps');
+    const resSp = document.getElementById('res');
+    const dot = document.getElementById('liveDot');
+    let frames = 0, lastTime = performance.now(), fpsVal = 0;
+
+    img.onload = () => {{
+      frames++;
+      const now = performance.now();
+      const dt = (now - lastTime) / 1000;
+      if (dt >= 1.0) {{
+        fpsVal = Math.round(frames / dt);
+        fpsSp.textContent = fpsVal + ' fps';
+        frames = 0; lastTime = now;
+      }}
+      st.textContent = 'Live';
+      dot.classList.add('active');
+      if (img.naturalWidth) resSp.textContent = img.naturalWidth + '\u00d7' + img.naturalHeight;
+    }};
+    img.onerror = () => {{
+      st.textContent = 'Reconnecting\u2026';
+      dot.classList.remove('active');
+      setTimeout(() => {{ img.src = '/stream?' + Date.now(); }}, 1500);
+    }};
+
+    function takeSnapshot() {{
+      const a = document.createElement('a');
+      a.href = '/snapshot'; a.download = 'turtlebot3_' + Date.now() + '.jpg';
+      a.click();
+    }}
+    function toggleFullscreen() {{
+      if (!document.fullscreenElement) {{
+        document.body.requestFullscreen().then(() => document.body.classList.add('fullscreen'));
+      }} else {{
+        document.exitFullscreen().then(() => document.body.classList.remove('fullscreen'));
+      }}
+    }}
+    document.addEventListener('keydown', e => {{
+      if (e.key === 'f' || e.key === 'F') toggleFullscreen();
+      if (e.key === 's' || e.key === 'S') takeSnapshot();
+    }});
   </script>
 </body>
 </html>
@@ -151,7 +248,7 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
                     self.wfile.write(data)
                     self.wfile.write(b'\r\n')
                     self.wfile.flush()
-                time.sleep(0.066)  # ~15 fps cap
+                time.sleep(0.05)  # ~20 fps cap
         except (BrokenPipeError, ConnectionResetError):
             pass  # Client disconnected
 
@@ -432,6 +529,34 @@ class TurtleBot3Bridge:
         with self._image_lock:
             return self._image_data, self._image_stamp
 
+    def wait_for_fresh_frame(self, timeout=1.0):
+        """Block until a camera frame newer than the current one arrives.
+
+        This ensures the returned image was captured *after* this method was
+        called — critical for avoiding stale / motion-blurred frames after a
+        turn or other motion command.
+
+        Args:
+            timeout: Maximum seconds to wait for a new frame.
+
+        Returns:
+            tuple: ``(jpeg_bytes, iso_timestamp)`` of the fresh frame,
+                   or the latest cached frame if timeout expires.
+        """
+        with self._image_lock:
+            old_stamp = self._image_stamp
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.05)  # 50 ms poll — well within one camera frame
+            with self._image_lock:
+                if self._image_stamp is not None and self._image_stamp != old_stamp:
+                    return self._image_data, self._image_stamp
+
+        # Timeout — return whatever we have (better than nothing)
+        with self._image_lock:
+            return self._image_data, self._image_stamp
+
     # ------------------------------------------------------------------
     # Camera viewer (MJPEG stream)
     # ------------------------------------------------------------------
@@ -509,6 +634,124 @@ class TurtleBot3Bridge:
             return self._odom_data
 
     # ------------------------------------------------------------------
+    # Lidar obstacle detection helpers
+    # ------------------------------------------------------------------
+
+    def check_obstacle(self, direction="front", arc_half_angle_deg=30):
+        """Return the minimum range (m) in a given direction arc.
+
+        Args:
+            direction: One of 'front', 'left', 'right', 'back'.
+            arc_half_angle_deg: Half-width of the arc to check.
+
+        Returns:
+            float or None: Minimum valid range in the arc, or None if no data.
+        """
+        scan = self.get_lidar()
+        if scan is None:
+            return None
+
+        ranges = scan["ranges"]
+        n = len(ranges)
+        if n == 0:
+            return None
+
+        # Centre angle for each direction (LDS-02: 0° = front, CCW)
+        centres = {"front": 0, "left": 90, "back": 180, "right": 270}
+        centre = centres.get(direction, 0)
+
+        min_range = float("inf")
+        for i, r in enumerate(ranges):
+            angle = (i / n) * 360.0
+            # Angular distance from centre (handles wrap-around)
+            diff = abs(angle - centre)
+            if diff > 180:
+                diff = 360 - diff
+            if diff <= arc_half_angle_deg:
+                if not math.isinf(r) and r > 0:
+                    min_range = min(min_range, r)
+
+        return min_range if not math.isinf(min_range) else None
+
+    def check_path_clear(self, direction="front", threshold_m=DEFAULT_SAFETY_MARGIN_M):
+        """Check whether a direction is clear of obstacles.
+
+        Returns:
+            dict with {clear: bool, min_distance_m: float|None, direction: str, threshold_m: float}
+        """
+        min_dist = self.check_obstacle(direction=direction)
+        if min_dist is None:
+            return {
+                "clear": False,
+                "min_distance_m": None,
+                "direction": direction,
+                "threshold_m": threshold_m,
+                "reason": "No lidar data available",
+            }
+        return {
+            "clear": min_dist >= threshold_m,
+            "min_distance_m": round(min_dist, 3),
+            "direction": direction,
+            "threshold_m": threshold_m,
+        }
+
+    # ------------------------------------------------------------------
+    # Trapezoidal velocity profile helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _trapezoidal_speed(dist_done, dist_total, target_speed,
+                           ramp_dist=LINEAR_RAMP_DISTANCE,
+                           min_speed=MIN_LINEAR_SPEED):
+        """Compute linear speed for a trapezoidal velocity profile.
+
+        Ramps up over the first ``ramp_dist`` metres, holds at ``target_speed``,
+        then ramps down over the last ``ramp_dist`` metres.
+        """
+        dist_remaining = dist_total - dist_done
+
+        # Short moves where ramp-up + ramp-down > total distance
+        effective_ramp = min(ramp_dist, dist_total / 2.0)
+        if effective_ramp < 0.001:
+            return target_speed
+
+        if dist_done < effective_ramp:
+            # Ramp up
+            frac = dist_done / effective_ramp
+            speed = min_speed + frac * (target_speed - min_speed)
+        elif dist_remaining < effective_ramp:
+            # Ramp down
+            frac = dist_remaining / effective_ramp
+            speed = min_speed + frac * (target_speed - min_speed)
+        else:
+            # Cruise
+            speed = target_speed
+
+        return max(min_speed, min(speed, target_speed))
+
+    @staticmethod
+    def _trapezoidal_angular_speed(angle_done_rad, angle_total_rad, target_speed,
+                                   ramp_rad=math.radians(ANGULAR_RAMP_DEG),
+                                   min_speed=MIN_ANGULAR_SPEED):
+        """Compute angular speed for a trapezoidal velocity profile."""
+        angle_remaining = angle_total_rad - angle_done_rad
+
+        effective_ramp = min(ramp_rad, angle_total_rad / 2.0)
+        if effective_ramp < 0.001:
+            return target_speed
+
+        if angle_done_rad < effective_ramp:
+            frac = angle_done_rad / effective_ramp
+            speed = min_speed + frac * (target_speed - min_speed)
+        elif angle_remaining < effective_ramp:
+            frac = angle_remaining / effective_ramp
+            speed = min_speed + frac * (target_speed - min_speed)
+        else:
+            speed = target_speed
+
+        return max(min_speed, min(speed, target_speed))
+
+    # ------------------------------------------------------------------
     # Public motion API
     # ------------------------------------------------------------------
 
@@ -533,8 +776,12 @@ class TurtleBot3Bridge:
             time.sleep(0.05)
         return True
 
-    def move_forward(self, distance_m=0.5, speed=0.2, timeout=None):
+    def move_forward(self, distance_m=0.5, speed=0.2, timeout=None,
+                     safety_margin_m=DEFAULT_SAFETY_MARGIN_M):
         """Move forward ``distance_m`` metres at ``speed`` m/s.
+
+        Uses trapezoidal velocity ramping for smooth start/stop and
+        reactive lidar obstacle checking on every control tick.
 
         Returns a dict with ``{success, distance_requested, distance_actual,
         start_position, end_position, message}``.
@@ -576,6 +823,28 @@ class TurtleBot3Bridge:
                         "message": f"Timed out after {timeout}s",
                     }
 
+                # Reactive lidar obstacle check
+                front_dist = self.check_obstacle(direction="front")
+                if front_dist is not None and front_dist < safety_margin_m:
+                    self.stop()
+                    cur = self.get_odom()
+                    cx, cy = cur["position"]["x"], cur["position"]["y"]
+                    dist_actual = math.hypot(cx - sx, cy - sy)
+                    return {
+                        "success": False,
+                        "obstacle_detected": True,
+                        "obstacle_distance_m": round(front_dist, 3),
+                        "distance_requested_m": distance_m,
+                        "distance_actual_m": round(dist_actual, 4),
+                        "start_position": {"x": round(sx, 4), "y": round(sy, 4)},
+                        "end_position": {"x": round(cx, 4), "y": round(cy, 4)},
+                        "message": (
+                            f"Obstacle detected {front_dist:.2f}m ahead "
+                            f"(safety margin {safety_margin_m}m). Stopped after "
+                            f"{dist_actual:.3f}m of {distance_m}m."
+                        ),
+                    }
+
                 cur = self.get_odom()
                 cx, cy = cur["position"]["x"], cur["position"]["y"]
                 dist_actual = math.hypot(cx - sx, cy - sy)
@@ -591,14 +860,21 @@ class TurtleBot3Bridge:
                         "message": "Target distance reached",
                     }
 
-                self._publish_twist(linear_x=speed)
+                # Trapezoidal velocity profile
+                cmd_speed = self._trapezoidal_speed(
+                    dist_actual, distance_m, speed
+                )
+                self._publish_twist(linear_x=cmd_speed)
                 time.sleep(rate_sleep)
         except Exception as e:
             self.stop()
             return {"success": False, "message": f"Error during move: {e}"}
 
-    def turn(self, angle_deg=90.0, angular_speed=0.5, timeout=None):
+    def turn(self, angle_deg=90.0, angular_speed=0.25, timeout=None):
         """Turn ``angle_deg`` degrees (positive = CCW, negative = CW).
+
+        Uses trapezoidal angular velocity ramping for smooth rotation and
+        checks front lidar to avoid rotating into immediate obstacles.
 
         Returns a dict with ``{success, angle_requested_deg, angle_actual_deg,
         start_yaw_deg, end_yaw_deg, message}``.
@@ -642,6 +918,25 @@ class TurtleBot3Bridge:
                         "message": f"Timed out after {timeout}s",
                     }
 
+                # Safety check: don't rotate into a very close obstacle
+                front_dist = self.check_obstacle(direction="front")
+                if front_dist is not None and front_dist < 0.15:
+                    self.stop()
+                    cur = self.get_odom()
+                    return {
+                        "success": False,
+                        "obstacle_detected": True,
+                        "obstacle_distance_m": round(front_dist, 3),
+                        "angle_requested_deg": angle_deg,
+                        "angle_actual_deg": round(math.degrees(accumulated), 2),
+                        "start_yaw_deg": round(math.degrees(start_yaw), 2),
+                        "end_yaw_deg": round(cur["orientation_yaw_deg"], 2),
+                        "message": (
+                            f"Obstacle very close ({front_dist:.2f}m) in front "
+                            f"during turn. Stopped after {math.degrees(accumulated):.1f}°."
+                        ),
+                    }
+
                 cur = self.get_odom()
                 cur_yaw = cur["orientation_yaw_rad"]
                 delta = _normalize_angle(cur_yaw - prev_yaw)
@@ -650,6 +945,9 @@ class TurtleBot3Bridge:
 
                 if abs(accumulated) >= target_rad_abs:
                     self.stop()
+                    # Let the robot physically decelerate and the camera
+                    # publish a stable, non-blurred frame before returning.
+                    time.sleep(0.3)
                     return {
                         "success": True,
                         "angle_requested_deg": angle_deg,
@@ -659,8 +957,113 @@ class TurtleBot3Bridge:
                         "message": "Target angle reached",
                     }
 
-                self._publish_twist(angular_z=direction * angular_speed)
+                # Trapezoidal angular velocity profile
+                cmd_angular = self._trapezoidal_angular_speed(
+                    abs(accumulated), target_rad_abs, angular_speed
+                )
+                self._publish_twist(angular_z=direction * cmd_angular)
                 time.sleep(rate_sleep)
         except Exception as e:
             self.stop()
             return {"success": False, "message": f"Error during turn: {e}"}
+
+    def navigate_safely(self, distance_m=0.5, speed=0.15,
+                        obstacle_threshold_m=0.3):
+        """Navigate forward with integrated lidar-based obstacle avoidance.
+
+        If the front is blocked, attempts a corrective turn toward the clearer
+        side (left or right), then retries forward motion. Makes up to 3
+        correction attempts before giving up.
+
+        Returns a dict with navigation result.
+        """
+        speed = min(abs(speed), MAX_LINEAR_SPEED)
+        distance_m = abs(distance_m)
+        max_corrections = 3
+
+        if not self._wait_for_odom():
+            self.stop()
+            return {"success": False, "message": "No odometry data available."}
+
+        start_odom = self.get_odom()
+        sx, sy = start_odom["position"]["x"], start_odom["position"]["y"]
+        total_moved = 0.0
+        corrections = 0
+
+        while total_moved < distance_m:
+            remaining = distance_m - total_moved
+
+            # Check front clearance
+            front_dist = self.check_obstacle(direction="front")
+            if front_dist is not None and front_dist < obstacle_threshold_m:
+                if corrections >= max_corrections:
+                    self.stop()
+                    cur = self.get_odom()
+                    return {
+                        "success": False,
+                        "distance_requested_m": distance_m,
+                        "distance_actual_m": round(total_moved, 4),
+                        "corrections_attempted": corrections,
+                        "message": (
+                            f"Path blocked after {corrections} correction attempts. "
+                            f"Front obstacle at {front_dist:.2f}m. Moved {total_moved:.3f}m "
+                            f"of {distance_m}m."
+                        ),
+                    }
+
+                # Determine which side is clearer
+                left_dist = self.check_obstacle(direction="left") or 0
+                right_dist = self.check_obstacle(direction="right") or 0
+
+                if left_dist >= right_dist:
+                    turn_angle = 30.0   # Turn left
+                else:
+                    turn_angle = -30.0  # Turn right
+
+                _stderr(f"Obstacle at {front_dist:.2f}m — correcting {turn_angle}°")
+                self.turn(angle_deg=turn_angle, angular_speed=0.4)
+                corrections += 1
+                continue
+
+            # Move a segment (max 0.3m per segment for frequent checking)
+            segment = min(remaining, 0.3)
+            result = self.move_forward(
+                distance_m=segment, speed=speed,
+                safety_margin_m=obstacle_threshold_m,
+            )
+
+            if result.get("success"):
+                total_moved += result.get("distance_actual_m", 0)
+            elif result.get("obstacle_detected"):
+                total_moved += result.get("distance_actual_m", 0)
+                # Let the loop try a correction on next iteration
+                corrections += 1
+                if corrections > max_corrections:
+                    cur = self.get_odom()
+                    return {
+                        "success": False,
+                        "distance_requested_m": distance_m,
+                        "distance_actual_m": round(total_moved, 4),
+                        "corrections_attempted": corrections,
+                        "message": result["message"],
+                    }
+                continue
+            else:
+                # Other failure (timeout, no odom, etc.)
+                return result
+
+        cur = self.get_odom()
+        cx, cy = cur["position"]["x"], cur["position"]["y"]
+        return {
+            "success": True,
+            "distance_requested_m": distance_m,
+            "distance_actual_m": round(math.hypot(cx - sx, cy - sy), 4),
+            "corrections_attempted": corrections,
+            "start_position": {"x": round(sx, 4), "y": round(sy, 4)},
+            "end_position": {"x": round(cx, 4), "y": round(cy, 4)},
+            "message": (
+                f"Navigated {distance_m}m with {corrections} obstacle corrections."
+                if corrections > 0
+                else f"Navigated {distance_m}m — path was clear."
+            ),
+        }
