@@ -114,50 +114,57 @@ class ToolHandler(RequestHandler):
             return tool_response
 
         content = tool_response.content
-        content = content[0] if isinstance(content, list) else content
+        if not isinstance(content, list):
+            content = [content]
 
-        # MCP data types: https://github.com/modelcontextprotocol/python-sdk/blob/main/src/mcp/types.py
-        if isinstance(content, ImageContent):
-            # decode the image data
-            image_data = base64.b64decode(content.data)
-            # if empty, return None
-            unique_filename = f"{uuid.uuid4()}.png"
-            # save the image to a temporary file   
-            # FIXME: not secure, but works for now
-            default_image = os.path.join(tempfile.gettempdir(), unique_filename)
-            # Write the binary data to a PNG file
-            with open(default_image, "wb") as f:
-                f.write(image_data)
-            return f"{default_image}"
-        elif isinstance(content, TextContent):
-            # if content is TextContent, return the text
-            return content.text
-        elif isinstance(content, AudioContent):
-            # if content is AudioContent, return the audio data
-            # length of audio data is not used, so we can ignore it
-            audio_data = content.data
-            if len(audio_data) == 0:
-                logger.warning("No audio data returned from the tool.")
-                return None
-            if isinstance(audio_data, str):
-                logger.info(f"Audio data is a base64 string of length {len(audio_data)}")
-            # FIXME: use mimeType: str in AudioContent for better format detection
-            audio_format = content.format if hasattr(content, 'format') else 'wav'
-            audio_data = base64.b64decode(content.data)
-            
-            meta = content.metadata if hasattr(content, 'metadata') else {}
-            logger.info(f"Audio data format: {audio_format}, metadata: {meta}")
-            unique_filename = f"{uuid.uuid4()}.{audio_format}"
-            default_audio = os.path.join(tempfile.gettempdir(), unique_filename)
-            # FIXME: this info: channels, sample width, and frame rate are typical for WAV files
-            # should be part of metadata in the AudioContent, but for now we assume mono, 16-bit, 16kHz
-            # FIXME: not secure, but works for now
-            with wave.open(default_audio, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(audio_data)
-            return f"{default_audio}"
+        # Handle multi-content responses (e.g., rotate_and_scan returns
+        # text + multiple images).  Collect all text parts and save all
+        # images to temp files, returning a combined text response.
+        text_parts = []
+        image_paths = []
+
+        for item in content:
+            # MCP data types: https://github.com/modelcontextprotocol/python-sdk/blob/main/src/mcp/types.py
+            if isinstance(item, ImageContent):
+                image_data = base64.b64decode(item.data)
+                unique_filename = f"{uuid.uuid4()}.png"
+                default_image = os.path.join(tempfile.gettempdir(), unique_filename)
+                with open(default_image, "wb") as f:
+                    f.write(image_data)
+                image_paths.append(default_image)
+            elif isinstance(item, TextContent):
+                text_parts.append(item.text)
+            elif isinstance(item, AudioContent):
+                audio_data = item.data
+                if len(audio_data) == 0:
+                    logger.warning("No audio data returned from the tool.")
+                    continue
+                if isinstance(audio_data, str):
+                    logger.info(f"Audio data is a base64 string of length {len(audio_data)}")
+                audio_format = item.format if hasattr(item, 'format') else 'wav'
+                audio_data = base64.b64decode(item.data)
+                meta = item.metadata if hasattr(item, 'metadata') else {}
+                logger.info(f"Audio data format: {audio_format}, metadata: {meta}")
+                unique_filename = f"{uuid.uuid4()}.{audio_format}"
+                default_audio = os.path.join(tempfile.gettempdir(), unique_filename)
+                with wave.open(default_audio, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(16000)
+                    wf.writeframes(audio_data)
+                text_parts.append(f"{default_audio}")
+
+        # Single-image shortcut: return just the path so _maybe_inject_image
+        # can detect it (backward compatible with existing single-image tools).
+        if len(image_paths) == 1 and not text_parts:
+            return image_paths[0]
+
+        # Multi-content: combine text + image paths
+        if image_paths:
+            text_parts.append("\n".join(image_paths))
+
+        if text_parts:
+            return "\n".join(text_parts)
 
         return "Undefined content type returned from the tool."
 

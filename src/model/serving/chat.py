@@ -214,42 +214,71 @@ _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 
 
 def _maybe_inject_image(tool_response: str, messages: list, chat_ui=None, verbose=False):
-    """If a tool returned an image file path, inject it into the message list.
+    """If a tool returned image file path(s), inject them into the message list.
 
     VLMs (like Qwen-VL) need the actual image pixels in the conversation.
     When an MCP tool returns an ImageContent, the ToolHandler saves it to a
     temp file and returns the path.  This function detects that pattern and
-    appends a user message with the base64-encoded image so the VLM can
-    analyse it on the next iteration.
+    appends a user message with the base64-encoded image(s) so the VLM can
+    analyse them on the next iteration.
+
+    Handles both single image paths and multi-line responses containing
+    multiple image paths (e.g., from rotate_and_scan).
     """
     if not tool_response:
         return
-    path = tool_response.strip()
-    ext = os.path.splitext(path)[1].lower()
-    if ext not in _IMAGE_EXTENSIONS:
+
+    # Collect all image file paths from the response (one per line or the
+    # whole response if it's a single path).
+    image_paths = []
+    for line in tool_response.strip().splitlines():
+        candidate = line.strip()
+        ext = os.path.splitext(candidate)[1].lower()
+        if ext in _IMAGE_EXTENSIONS and os.path.isfile(candidate):
+            image_paths.append(candidate)
+
+    if not image_paths:
         return
-    if not os.path.isfile(path):
-        return
+
     try:
-        with open(path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-        mime = {
-            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-            ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
-        }.get(ext, "image/png")
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "The tool returned this image. Describe what you see in detail:"},
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-            ],
-        })
+        content_parts = []
+        if len(image_paths) == 1:
+            content_parts.append({
+                "type": "text",
+                "text": "The tool returned this image. Describe what you see in detail:",
+            })
+        else:
+            content_parts.append({
+                "type": "text",
+                "text": (
+                    f"The tool returned {len(image_paths)} images captured at "
+                    "different headings during a rotation scan. Examine EVERY "
+                    "image carefully for the target object. Describe what you "
+                    "see in each image:"
+                ),
+            })
+
+        for path in image_paths:
+            ext = os.path.splitext(path)[1].lower()
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+            mime = {
+                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
+            }.get(ext, "image/png")
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+
+        messages.append({"role": "user", "content": content_parts})
+
         if chat_ui:
-            chat_ui.add_log(f"Injected image ({ext}) into VLM context", level="info")
+            chat_ui.add_log(f"Injected {len(image_paths)} image(s) into VLM context", level="info")
         elif verbose:
-            logger.info("Injected tool-returned image into VLM context: %s", path)
+            logger.info("Injected %d tool-returned image(s) into VLM context", len(image_paths))
     except Exception as e:
-        logger.warning("Failed to inject image from %s: %s", path, e)
+        logger.warning("Failed to inject image(s): %s", e)
 
 
 async def chat(host: str = "http://127.0.0.1:8001/v1",

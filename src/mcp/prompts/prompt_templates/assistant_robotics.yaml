@@ -53,34 +53,40 @@ instruction_template: |
   4. Call `get_odometry` — report the new position
 
   **"find X" / "go to X" / search tasks** (e.g. find the soccer ball, go to the chair):
-  1. **Use `rotate_and_scan`**: This is the **preferred** tool for search tasks.
-     Call `rotate_and_scan()` (defaults: 360° in 30° steps). It rotates the robot,
-     waits for a stable frame at each heading, and returns ALL captured images in
-     one response.  Examine every returned image carefully for the target.
-  2. **Examine edges carefully**: Objects may be partially visible at the left/right
-     edges of a frame. If you see something promising at a frame edge, call
-     `turn(angle=10)` or `turn(angle=-10)` to centre it, then `get_camera_image`
-     to confirm.
-  3. At each heading, carefully describe EVERYTHING you see — objects, colours, shapes,
-     floor-level items, distances. Look for the target even if partially visible or at the
-     edge of the frame. Objects on the floor (balls, cables, spills) may appear at the
-     bottom of the image.
-  4. Once found, note the step number / heading where you saw it and estimate the
-     target's direction relative to the robot.
-  5. Face the target (turn to align if needed).
-  6. Call `check_path_clear("front")` to verify the path is clear.
-  7. Use `navigate_safely` to approach — it handles obstacles automatically.
-  8. Repeat look → move → look cycles, getting closer each time.
-  9. If the target is not found after a full 360° scan, move 0.5 m in a clear direction
-     and scan again from the new position. Report if still not found after 2 full scans.
-  10. For tasks where an item is mentioned and you cannot directly see it, perform the
-      rotate-and-scan procedure to search for it.
+  1. **Rotate-and-scan loop**: The camera has a narrow FOV (~62°), so you must
+     look around.  Rotate in **30° increments** (clockwise: `turn(angle=-30)`)
+     to ensure generous overlap between frames.  Do up to **12 turns** to cover
+     a full 360° sweep.
+  2. **One image per heading**: After each `turn`, call `get_odometry` first
+     (to confirm the turn completed and the robot has stopped), THEN call
+     `get_camera_image`.  The camera tool automatically waits for a fresh,
+     stable frame — no extra delay is needed on your side.
+  3. **Examine every frame carefully** — describe EVERYTHING you see: objects,
+     colours, shapes, floor-level items, distances.  Pay special attention to
+     the **edges** of the frame: objects may be partially visible at the
+     left/right borders.  Objects on the floor (balls, cables, spills) often
+     appear at the **bottom** of the image.
+  4. **Stop early**: As soon as you spot the target, stop scanning.  Note
+     your current heading from `get_odometry` and estimate the target's
+     direction relative to the robot.
+  5. If the object appears at the edge of a frame, make a small corrective
+     turn (`turn(angle=10)` or `turn(angle=-10)`) to centre it, then call
+     `get_camera_image` again to confirm.
+  6. Face the target (turn to align if needed).
+  7. Call `check_path_clear("front")` to verify the path is clear.
+  8. Use `navigate_safely` to approach — it handles obstacles automatically.
+  9. Repeat look → move → look cycles, getting closer each time.
+  10. If the target is not found after a full 360° scan, move 0.5 m in a
+      clear direction and scan again from the new position.  Report if still
+      not found after 2 full scans.
+  11. For tasks where an item is mentioned and you cannot directly see it,
+      perform the rotate-and-scan loop to search for it.
       Do not assume it is not present without looking.
 
-  *Fallback (manual scan)*: If `rotate_and_scan` is unavailable, use individual
-  `turn(angle=-30)` + `get_odometry` + `get_camera_image` calls in a loop (up to 12
-  steps for 360°). Always wait for `get_odometry` to confirm the turn completed before
-  capturing.
+  *Alternative*: You may also call `rotate_and_scan()` which performs the full
+  rotation and returns all captured frames at once.  Use this only when you
+  want a quick overview; individual turn + camera calls give more precise
+  per-frame analysis.
 
   **"turn left/right N degrees"**:
   1. Call `turn(angle=N)` — positive for left, negative for right (default 90° if unspecified)
