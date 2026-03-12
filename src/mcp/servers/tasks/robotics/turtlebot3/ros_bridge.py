@@ -1285,6 +1285,89 @@ class TurtleBot3Bridge:
             self.stop()
             return {"success": False, "message": f"Error during turn: {e}"}
 
+    def turn_to_heading(self, target_deg, tolerance_deg=3.0,
+                        max_corrections=2, angular_speed=0.5):
+        """Turn to face an absolute heading (in degrees).
+
+        Computes the shortest rotation path (handling 0/360 wrap-around)
+        and optionally performs corrective micro-turns if the residual error
+        exceeds *tolerance_deg*.
+
+        Args:
+            target_deg: Desired heading in degrees (0–360).
+            tolerance_deg: Acceptable error in degrees (default 3.0).
+            max_corrections: Maximum corrective micro-turns (default 2).
+            angular_speed: Angular speed in rad/s (default 0.5).
+
+        Returns:
+            dict with ``{success, target_heading_deg, actual_heading_deg,
+            error_deg, corrections_made, message}``.
+        """
+        if not self._wait_for_odom():
+            return {
+                "success": False,
+                "target_heading_deg": target_deg,
+                "message": "No odometry data available — is the robot running?",
+            }
+
+        corrections_made = 0
+
+        for attempt in range(1 + max_corrections):
+            odom = self.get_odom()
+            current_deg = odom["orientation_yaw_deg"]
+
+            # Shortest path: result in [-180, 180]
+            delta = (target_deg - current_deg + 180.0) % 360.0 - 180.0
+
+            if abs(delta) <= tolerance_deg:
+                return {
+                    "success": True,
+                    "target_heading_deg": round(target_deg, 2),
+                    "actual_heading_deg": round(current_deg, 2),
+                    "error_deg": round(abs(delta), 2),
+                    "corrections_made": corrections_made,
+                    "message": (
+                        "On target" if attempt == 0
+                        else f"On target after {corrections_made} correction(s)"
+                    ),
+                }
+
+            # Execute the turn
+            result = self.turn(angle_deg=delta, angular_speed=angular_speed)
+
+            if attempt > 0:
+                corrections_made += 1
+
+            if not result.get("success"):
+                # Turn failed — report with current state
+                final_odom = self.get_odom()
+                final_deg = final_odom["orientation_yaw_deg"] if final_odom else current_deg
+                final_error = abs((target_deg - final_deg + 180.0) % 360.0 - 180.0)
+                return {
+                    "success": False,
+                    "target_heading_deg": round(target_deg, 2),
+                    "actual_heading_deg": round(final_deg, 2),
+                    "error_deg": round(final_error, 2),
+                    "corrections_made": corrections_made,
+                    "message": f"Turn failed: {result.get('message', '?')}",
+                }
+
+        # All attempts exhausted — return best effort
+        final_odom = self.get_odom()
+        final_deg = final_odom["orientation_yaw_deg"] if final_odom else target_deg
+        final_error = abs((target_deg - final_deg + 180.0) % 360.0 - 180.0)
+        return {
+            "success": final_error <= tolerance_deg,
+            "target_heading_deg": round(target_deg, 2),
+            "actual_heading_deg": round(final_deg, 2),
+            "error_deg": round(final_error, 2),
+            "corrections_made": corrections_made,
+            "message": (
+                "On target" if final_error <= tolerance_deg
+                else f"Residual error {final_error:.1f}° after {corrections_made} correction(s)"
+            ),
+        }
+
     def navigate_safely(self, distance_m=0.5, speed=0.15,
                         obstacle_threshold_m=0.3):
         """Navigate forward with integrated lidar-based obstacle avoidance.

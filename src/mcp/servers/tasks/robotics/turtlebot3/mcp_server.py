@@ -247,6 +247,34 @@ def turn(
 
 
 @mcp.tool(
+    title="Turn to Heading",
+    description=(
+        "Turn the TurtleBot3 to face an absolute heading in degrees. "
+        "Unlike the 'turn' tool which takes a relative angle, this tool "
+        "takes an absolute heading (e.g., 90° for East) and automatically "
+        "computes the shortest rotation path, handling 0°/360° wrap-around. "
+        "After the initial turn, it checks the residual error and performs "
+        "up to 2 corrective micro-turns if needed (tolerance: 3°). "
+        "Use this after rotate_and_scan to face the heading where a target "
+        "was spotted."
+    ),
+)
+def turn_to_heading(
+    target_heading_deg: float,
+) -> str:
+    """Turn to face an absolute heading.
+
+    Args:
+        target_heading_deg: Desired heading in degrees (e.g., 0=North, 90=East,
+            180=South, 270=West). Uses the same coordinate frame as odometry
+            and rotate_and_scan headings.
+    """
+    bridge = _get_bridge()
+    result = bridge.turn_to_heading(target_deg=target_heading_deg)
+    return json.dumps(result, indent=2, default=_json_default)
+
+
+@mcp.tool(
     title="Stop",
     description=(
         "Immediately stop the TurtleBot3 by publishing zero velocity. "
@@ -556,7 +584,7 @@ def _heading_to_cardinal(deg: float) -> str:
 def _build_contact_sheet(
     jpeg_frames: list[bytes],
     headings: list[float],
-    cell_width: int = 400,
+    cell_width: int = 540,
     padding: int = 6,
 ) -> bytes:
     """Build an annotated contact-sheet grid from captured frames.
@@ -880,6 +908,144 @@ def rotate_and_scan(
     )
 
     return [summary, pano_image]
+
+
+# =========================================================================
+# TARGETED RE-ACQUISITION TOOL
+# =========================================================================
+
+@mcp.tool(
+    title="Look for Target (targeted sweep)",
+    description=(
+        "Perform a targeted sweep around an expected heading to re-acquire "
+        "a target that was spotted during rotate_and_scan.  The robot first "
+        "turns so the sweep is CENTERED on the given heading, then captures "
+        "full-resolution frames over a narrow arc (default 90°).\n\n"
+        "Use this AFTER rotate_and_scan when you know approximately where "
+        "the target is but need higher-resolution confirmation, or when "
+        "get_camera_image didn't show the target after turning to the "
+        "expected heading.\n\n"
+        "Returns: a text summary + ONE contact-sheet image with "
+        "full-resolution frames (no thumbnail downscaling)."
+    ),
+)
+def look_for_target(
+    heading_deg: float,
+    sweep_width_deg: float = 90.0,
+    step_angle: float = 15.0,
+    settle_time: float = 0.3,
+    speed: float = 0.3,
+):
+    """Targeted sweep around an expected heading with full-resolution frames.
+
+    Args:
+        heading_deg:    Center heading of the sweep in degrees (from
+                        rotate_and_scan contact-sheet labels).
+        sweep_width_deg: Total arc to sweep in degrees (default 90°).
+                        The sweep spans heading ± sweep_width/2.
+        step_angle:     Degrees per step (default 15°, finer than rotate_and_scan).
+        settle_time:    Seconds to wait after each step (default 0.3).
+        speed:          Angular speed in rad/s (default 0.3).
+    """
+    import time as _time
+    import math as _math
+
+    bridge = _get_bridge()
+
+    # --- Position at sweep start: heading - sweep_width/2 ---
+    start_heading = heading_deg - sweep_width_deg / 2.0
+    _stderr(f"look_for_target: centering on {heading_deg}°, "
+            f"sweeping {sweep_width_deg}° ({start_heading:.0f}° → "
+            f"{heading_deg + sweep_width_deg / 2.0:.0f}°)")
+
+    pos_result = bridge.turn_to_heading(target_deg=start_heading)
+    if not pos_result.get("success"):
+        _stderr(f"look_for_target: failed to reach start heading: {pos_result}")
+        # Continue anyway — partial sweep is better than nothing
+
+    # --- Sweep (reuses the same logic as rotate_and_scan) ---
+    sign = 1.0  # always sweep CCW (positive direction)
+    total_abs = abs(sweep_width_deg)
+    step_abs = abs(step_angle)
+    max_steps = max(1, int(round(total_abs / step_abs)))
+
+    raw_frames: list[bytes] = []
+    headings: list[float] = []
+
+    odom0 = bridge.get_odom()
+    sweep_accumulated_rad = 0.0
+    prev_yaw = _math.radians(odom0["orientation_yaw_deg"]) if odom0 else 0.0
+
+    # Capture first frame at the start position
+    image_bytes, _ = bridge.wait_for_fresh_frame(timeout=1.5)
+    if image_bytes is not None:
+        raw_frames.append(image_bytes)
+        odom_now = bridge.get_odom()
+        headings.append(round(odom_now["orientation_yaw_deg"], 1) if odom_now else start_heading)
+
+    for i in range(max_steps):
+        remaining_deg = total_abs - _math.degrees(sweep_accumulated_rad)
+        if remaining_deg < 2.0:
+            break
+
+        this_step_deg = min(step_abs, remaining_deg)
+        result = bridge.turn(angle_deg=sign * this_step_deg, angular_speed=speed)
+
+        if result and result.get("success"):
+            actual_deg = abs(result.get("angle_actual_deg", 0))
+            sweep_accumulated_rad += _math.radians(actual_deg)
+        elif result:
+            odom_now = bridge.get_odom()
+            if odom_now:
+                cur_yaw = _math.radians(odom_now["orientation_yaw_deg"])
+                delta = cur_yaw - prev_yaw
+                while delta > _math.pi:
+                    delta -= 2 * _math.pi
+                while delta < -_math.pi:
+                    delta += 2 * _math.pi
+                sweep_accumulated_rad += abs(delta)
+
+        odom_now = bridge.get_odom()
+        if odom_now:
+            prev_yaw = _math.radians(odom_now["orientation_yaw_deg"])
+
+        if settle_time > 0:
+            _time.sleep(settle_time)
+
+        image_bytes, _ = bridge.wait_for_fresh_frame(timeout=1.5)
+        if image_bytes is not None:
+            raw_frames.append(image_bytes)
+        else:
+            _stderr(f"  look_for_target step {i+1}/{max_steps}: no frame captured")
+
+        if odom_now:
+            headings.append(round(odom_now["orientation_yaw_deg"], 1))
+        else:
+            headings.append(round(start_heading + i * step_abs, 1))
+
+    if not raw_frames:
+        raise ValueError(
+            "look_for_target captured 0 frames. Is the camera node running?"
+        )
+
+    # Build contact sheet at FULL resolution (no downscaling)
+    sheet_bytes = _build_contact_sheet(raw_frames, headings, cell_width=640)
+    sheet_image = Image(data=sheet_bytes, format="jpeg")
+
+    bridge.set_mosaic(sheet_bytes)
+
+    swept_deg = _math.degrees(sweep_accumulated_rad)
+    summary = (
+        f"Targeted sweep: captured {len(raw_frames)} full-resolution frames "
+        f"over {swept_deg:.0f}° centered on heading {heading_deg:.0f}°.\n"
+        f"Headings (deg): {headings}\n\n"
+        "This is a FULL-RESOLUTION contact sheet — each frame is at camera "
+        "native resolution for maximum detail.  Examine every frame carefully "
+        "for the target object.  Report which frame [N] and heading shows "
+        "the target, or confirm it is not visible."
+    )
+
+    return [summary, sheet_image]
 
 
 # =========================================================================
