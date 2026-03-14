@@ -6,7 +6,7 @@
 
 "Check under the desk for any fallen objects."
 
-"Move toward the soccer ball and stop 50 cm away."
+"Move toward the soccer ball and stop 50 cm away." x
 
 "Patrol between the two lab chairs."
 

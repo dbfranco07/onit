@@ -9,10 +9,11 @@
 #   onit --a2a-client --a2a-task "tell me what you see"
 
 serving:
-  host: http://202.92.159.240:8000/v1
-  model: Qwen/Qwen3.5-27B
-  think: true
-  max_tokens: 80192
+  host: http://202.92.159.240:8001/v1
+  model: Qwen/Qwen3.5-9B
+  think: false
+  max_tokens: 8192
+  # max_tokens: 80192
 
 verbose: true
 show_logs: true
