@@ -47,6 +47,9 @@ LINEAR_RAMP_DISTANCE = 0.05   # metres — ramp over first/last 5 cm
 ANGULAR_RAMP_DEG = 5.0        # degrees — ramp over first/last 5°
 MIN_LINEAR_SPEED = 0.03       # m/s — floor so robot doesn't stall
 MIN_ANGULAR_SPEED = 0.1       # rad/s — floor so robot doesn't stall
+LINEAR_CMD_SMOOTHING_ALPHA = 0.35   # 0..1; higher follows target faster
+LINEAR_ACCEL_LIMIT = 0.35           # m/s^2 max increase per second
+LINEAR_DECEL_LIMIT = 0.6            # m/s^2 max decrease per second
 
 # Default obstacle safety margin
 DEFAULT_SAFETY_MARGIN_M = 0.25
@@ -721,19 +724,21 @@ class TurtleBot3Bridge:
         with self._image_lock:
             return self._image_data, self._image_stamp
 
-    def wait_for_fresh_frame(self, timeout=1.5):
+    def wait_for_fresh_frame(self, timeout=1.5, min_new_frames=2, poll_interval=0.05):
         """Block until a camera frame newer than the current one arrives.
 
         This ensures the returned image was captured *after* this method was
         called — critical for avoiding stale / motion-blurred frames after a
         turn or other motion command.
 
-        Waits for **two** new frames to arrive: the first frame after a stop
-        may still contain motion blur or a transitional image; the second
-        frame is reliably stable.
+        By default this waits for **two** new frames: the first frame after a
+        stop may still contain motion blur, while the second is usually stable.
+        Callers can reduce ``min_new_frames`` to 1 for lower latency.
 
         Args:
             timeout: Maximum seconds to wait for new frames.
+            min_new_frames: Number of distinct newer frames required.
+            poll_interval: Poll interval in seconds while waiting.
 
         Returns:
             tuple: ``(jpeg_bytes, iso_timestamp)`` of the fresh frame,
@@ -742,14 +747,17 @@ class TurtleBot3Bridge:
         with self._image_lock:
             old_stamp = self._image_stamp
 
+        min_new_frames = max(1, int(min_new_frames))
+        poll_interval = max(0.01, float(poll_interval))
+
         frames_seen = 0
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            time.sleep(0.05)  # 50 ms poll — well within one camera frame
+            time.sleep(poll_interval)
             with self._image_lock:
                 if self._image_stamp is not None and self._image_stamp != old_stamp:
                     frames_seen += 1
-                    if frames_seen >= 2:
+                    if frames_seen >= min_new_frames:
                         return self._image_data, self._image_stamp
                     # Update old_stamp to wait for the next distinct frame
                     old_stamp = self._image_stamp
@@ -1083,6 +1091,31 @@ class TurtleBot3Bridge:
 
         return max(min_speed, min(speed, target_speed))
 
+    @staticmethod
+    def _smooth_linear_speed(previous_speed, target_speed, dt,
+                             alpha=LINEAR_CMD_SMOOTHING_ALPHA,
+                             accel_limit=LINEAR_ACCEL_LIMIT,
+                             decel_limit=LINEAR_DECEL_LIMIT):
+        """Smooth linear velocity command to reduce jitter.
+
+        Applies low-pass filtering plus accel/decel rate limits so
+        published cmd_vel changes are gradual and stable.
+        """
+        dt = max(1e-3, float(dt))
+        alpha = max(0.0, min(1.0, float(alpha)))
+
+        target_speed = max(0.0, float(target_speed))
+        previous_speed = max(0.0, float(previous_speed))
+
+        filtered = previous_speed + alpha * (target_speed - previous_speed)
+
+        if filtered > previous_speed:
+            max_delta = max(0.0, float(accel_limit)) * dt
+            return min(filtered, previous_speed + max_delta)
+
+        max_delta = max(0.0, float(decel_limit)) * dt
+        return max(filtered, previous_speed - max_delta)
+
     # ------------------------------------------------------------------
     # Public motion API
     # ------------------------------------------------------------------
@@ -1139,6 +1172,7 @@ class TurtleBot3Bridge:
 
         start_time = time.monotonic()
         rate_sleep = 1.0 / CONTROL_HZ
+        prev_cmd_speed = 0.0
 
         try:
             while True:
@@ -1195,9 +1229,16 @@ class TurtleBot3Bridge:
                     }
 
                 # Trapezoidal velocity profile
-                cmd_speed = self._trapezoidal_speed(
+                target_cmd_speed = self._trapezoidal_speed(
                     dist_actual, distance_m, speed
                 )
+                cmd_speed = self._smooth_linear_speed(
+                    previous_speed=prev_cmd_speed,
+                    target_speed=target_cmd_speed,
+                    dt=rate_sleep,
+                )
+                prev_cmd_speed = cmd_speed
+
                 self._publish_twist(linear_x=cmd_speed)
                 time.sleep(rate_sleep)
         except Exception as e:
@@ -1262,7 +1303,7 @@ class TurtleBot3Bridge:
                     self.stop()
                     # Wait for the robot to physically settle, then read
                     # final yaw from odometry for an accurate report.
-                    time.sleep(0.3)
+                    time.sleep(0.1)
                     final = self.get_odom()
                     final_yaw = final["orientation_yaw_rad"] if final else cur_yaw
                     final_acc = accumulated + _normalize_angle(final_yaw - prev_yaw)

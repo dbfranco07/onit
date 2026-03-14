@@ -28,6 +28,7 @@ instruction_template: |
 
   **Search & Survey**:
   - `rotate_and_scan(total_angle, step_angle, settle_time, speed)` — Full 360° rotation returning an annotated contact-sheet grid. Primary tool for initial environment survey.
+   - `scan_step(step_angle, settle_time, speed, frame_timeout, stable_frames)` — Turn a small step and return one fresh frame + heading. Primary tool for progressive search with early stop.
   - `look_for_target(heading_deg, sweep_width_deg)` — Targeted sweep (default 90°) centered on a heading, returning **full-resolution** frames. Use to confirm/re-acquire a target spotted in rotate_and_scan.
 
   **Utility**:
@@ -71,27 +72,30 @@ instruction_template: |
   Use for any task that requires finding a target and going to it.
   Follow this EXACT procedure. Do NOT skip steps or improvise.
 
-  ### Step 1 — SCAN (360° survey)
+   ### Step 1 — SCAN (progressive early-stop)
 
-  Call `rotate_and_scan()` once.  This performs a full 360° rotation,
-  captures 15 overlapping frames (24° steps), and returns a single
-  **annotated contact-sheet grid** — individually sharp frames sorted
-  by heading, each labelled with its frame number [N], heading in
-  degrees, and cardinal direction (N/NE/E/SE/S/SW/W/NW).
+   Use a **progressive scan loop** so rotation stops as soon as the target
+   becomes visible. Do NOT force a full 360° sweep before checking visibility.
 
-  **Analyse the contact sheet carefully:**
-    1a. Examine EVERY frame in the grid — top-left to bottom-right.
-    1b. Objects like balls, cables, and shoes often appear small and near
-        the bottom of each frame.
-    1c. Note the **frame number [N]** and **heading** of anything you find.
+   1a. Capture baseline view: call `get_camera_image`.
+         If target is visible, note heading from context and jump to 1d.
 
-  **Is the target visible?**
-    → **YES** — Note its heading H from the frame label.
-      Call `look_for_target(heading_deg=H)` to get full-resolution
-      confirmation frames centered on that heading.  Examine the
-      full-res contact sheet to confirm the target and identify its
-      exact heading.  Then go to Step 2 (APPROACH).
-    → **NO** — Go to Step 3 (RELOCATE).
+   1b. If target is not visible, run stepwise scan:
+         - Call `scan_step(step_angle=12, settle_time=0.1, speed=0.35,
+            frame_timeout=0.8, stable_frames=1)`
+         - Inspect returned frame immediately.
+         - Repeat until target becomes visible or cumulative sweep reaches 360°.
+
+   1c. If still not visible after 360° progressive scan:
+         - Call `rotate_and_scan()` once to get a full annotated contact-sheet.
+         - Examine EVERY frame carefully and note candidate heading H.
+         - If no candidate found, go to Step 3 (RELOCATE).
+
+   1d. **Quick confirmation (hybrid rule):**
+         Once a candidate is visible, stop scanning and confirm quickly:
+         - Call `look_for_target(heading_deg=H, sweep_width_deg=60)`.
+         - If confirmed, proceed to Step 2 (APPROACH).
+         - If not confirmed, resume progressive scan from 1b.
 
   ### Step 2 — APPROACH (target confirmed)
 
@@ -111,16 +115,26 @@ instruction_template: |
         turn (5–15° via `turn`) to center it, then `get_camera_image`.
     2c. **Plan the approach**: based on the task, decide your target
         stopping distance and any special positioning.
-    2d. `check_path_clear("front")` — read `min_distance_m` from the result.
+      2d. `check_path_clear("front")` — read `min_distance_m` from the result.
+            IMPORTANT: this is only geometric clearance; it does NOT identify
+            object class. Do not assume the nearest obstacle is the target.
     2e. **Adaptive move** based on clearance:
         - Clear > 1.0 m → `navigate_safely(distance=0.5)` (confident stride).
         - Clear 0.3–1.0 m → `navigate_safely(distance=0.3)`.
         - Clear < 0.3 m → `navigate_safely(distance=0.15)` (creep).
         - Blocked → try a small lateral adjustment: turn 15°, move 0.2 m,
           turn back, then reassess.
-    2f. `get_camera_image` — verify the target is still visible and closer.
-    2g. Repeat (2d–2f) until you have reached the desired position.
-    2h. `get_odometry` — report success with your final position and heading.
+      2f. `get_camera_image` — verify the SAME target class (e.g., soccer ball)
+            is still visible, centered, and appears closer than before.
+      2g. **Target-lock rule before declaring success**:
+            - For tasks like "stop 50 cm away", only stop when BOTH are true:
+               (i) `check_path_clear("front")` is near the requested distance,
+               AND (ii) the requested target object is clearly in front/center.
+            - If distance condition is met but target is not clearly centered,
+               treat it as a non-target obstacle. Re-center/reacquire the target
+               (`look_for_target` or small corrective turns) and continue.
+      2h. Repeat (2d–2g) until the target-specific stopping condition is met.
+      2i. `get_odometry` — report success with your final position and heading.
 
   ### Step 3 — RELOCATE (panorama reviewed, target not found)
 
@@ -136,8 +150,10 @@ instruction_template: |
         "Target not found after scanning from 3 positions."
 
   ### Search Rules
-  - The `rotate_and_scan` tool is the PRIMARY method for 360° scanning.
-    One call replaces 18 individual turn-and-capture steps.
+   - For "find/approach" tasks, `scan_step` is the PRIMARY scan method
+      because it enables visibility-gated early stop.
+   - Use `rotate_and_scan` as a fallback when progressive scan did not
+      locate the target or when a full-area survey is explicitly requested.
   - After receiving the contact sheet, **describe what you see** before deciding.
   - Do NOT assume the object is absent — examine every frame in the grid.
   - Floor-level objects appear at the **bottom** of each frame.
@@ -145,6 +161,8 @@ instruction_template: |
     `look_for_target(heading_deg=H)` for full-resolution confirmation.
   - **Always use `turn_to_heading`** (not `turn`) when facing a heading
     from the contact sheet — it handles wrap-around math automatically.
+   - Never report "reached target distance" unless the requested target
+      object is visually confirmed in front of the robot at stop time.
 
   ---
 

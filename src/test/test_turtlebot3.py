@@ -250,6 +250,58 @@ class TestSensorsWithData:
         assert abs(odom["orientation_yaw_deg"]) < 1.0  # ~0 degrees
 
 
+class TestFreshFrameWait:
+    def _make_stamp(self, sec, nanosec=0):
+        stamp = MagicMock()
+        stamp.sec = sec
+        stamp.nanosec = nanosec
+        return stamp
+
+    def _publish_frame(self, bridge, data, sec):
+        msg = MagicMock()
+        msg.data = data
+        msg.header.stamp = self._make_stamp(sec)
+        bridge._camera_cb(msg)
+
+    def test_wait_for_fresh_frame_min_one(self, bridge):
+        self._publish_frame(bridge, b"frame_0", 1000)
+
+        def publish_next():
+            time.sleep(0.02)
+            self._publish_frame(bridge, b"frame_1", 1001)
+
+        t = threading.Thread(target=publish_next)
+        t.start()
+        data, _ = bridge.wait_for_fresh_frame(
+            timeout=0.3,
+            min_new_frames=1,
+            poll_interval=0.005,
+        )
+        t.join()
+
+        assert data == b"frame_1"
+
+    def test_wait_for_fresh_frame_min_two(self, bridge):
+        self._publish_frame(bridge, b"frame_0", 1000)
+
+        def publish_two():
+            time.sleep(0.02)
+            self._publish_frame(bridge, b"frame_1", 1001)
+            time.sleep(0.02)
+            self._publish_frame(bridge, b"frame_2", 1002)
+
+        t = threading.Thread(target=publish_two)
+        t.start()
+        data, _ = bridge.wait_for_fresh_frame(
+            timeout=0.5,
+            min_new_frames=2,
+            poll_interval=0.005,
+        )
+        t.join()
+
+        assert data == b"frame_2"
+
+
 # ---------------------------------------------------------------------------
 # Motion: stop
 # ---------------------------------------------------------------------------
@@ -848,7 +900,7 @@ class TestRotateAndScan:
         bridge.turn = mock_turn
 
         # Make wait_for_fresh_frame return a synthetic JPEG
-        def mock_fresh_frame(timeout=1.5):
+        def mock_fresh_frame(timeout=1.5, min_new_frames=2, poll_interval=0.05):
             return _make_test_jpeg(color=(step_count[0] * 15, 100, 200)), "2025-01-01T00:00:00+00:00"
         bridge.wait_for_fresh_frame = mock_fresh_frame
 
@@ -903,3 +955,53 @@ class TestRotateAndScan:
 
         sig = inspect.signature(tb3_mcp.rotate_and_scan)
         assert sig.parameters["step_angle"].default == 24.0
+
+
+class TestScanStep:
+    def test_scan_step_returns_frame_and_summary(self, bridge):
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        tb3_mcp._bridge = bridge
+
+        # Seed odometry
+        msg = MagicMock()
+        msg.pose.pose.position.x = 0.0
+        msg.pose.pose.position.y = 0.0
+        msg.pose.pose.position.z = 0.0
+        msg.pose.pose.orientation.x = 0.0
+        msg.pose.pose.orientation.y = 0.0
+        msg.pose.pose.orientation.z = 0.0
+        msg.pose.pose.orientation.w = 1.0
+        msg.twist.twist.linear.x = 0.0
+        msg.twist.twist.linear.y = 0.0
+        msg.twist.twist.angular.z = 0.0
+        stamp = MagicMock()
+        stamp.sec = 1000
+        stamp.nanosec = 0
+        msg.header.stamp = stamp
+        bridge._odom_cb(msg)
+
+        bridge.turn = MagicMock(return_value={"success": True, "angle_actual_deg": 12.0})
+        bridge.wait_for_fresh_frame = MagicMock(
+            return_value=(_make_test_jpeg(), "2025-01-01T00:00:00+00:00")
+        )
+
+        result = tb3_mcp.scan_step(step_angle=12.0)
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+        summary = json.loads(result[0])
+        assert summary["success"] is True
+        assert summary["frame"] == "ok"
+
+    def test_scan_step_missing_frame_returns_json(self, bridge):
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        tb3_mcp._bridge = bridge
+
+        bridge.turn = MagicMock(return_value={"success": True, "angle_actual_deg": 12.0})
+        bridge.wait_for_fresh_frame = MagicMock(return_value=(None, None))
+
+        result = tb3_mcp.scan_step(step_angle=12.0)
+        payload = json.loads(result)
+
+        assert payload["success"] is True
+        assert payload["frame"] == "missing"

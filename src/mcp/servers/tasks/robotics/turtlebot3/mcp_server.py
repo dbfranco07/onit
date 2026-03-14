@@ -72,7 +72,11 @@ def get_camera_image() -> Image:
     bridge = _get_bridge()
     # wait_for_fresh_frame blocks until a frame newer than the current
     # cached one arrives, avoiding stale / motion-blurred images.
-    image_bytes, timestamp = bridge.wait_for_fresh_frame(timeout=1.0)
+    image_bytes, timestamp = bridge.wait_for_fresh_frame(
+        timeout=1.0,
+        min_new_frames=1,
+        poll_interval=0.03,
+    )
 
     if image_bytes is None:
         raise ValueError(
@@ -751,6 +755,73 @@ def _stitch_panorama(
 # =========================================================================
 
 @mcp.tool(
+    title="Scan Step (progressive search)",
+    description=(
+        "Turn a small angle and return ONE fresh camera frame plus heading. "
+        "Use this for progressive search loops where you must stop as soon "
+        "as the target becomes visible. This tool is low-latency and intended "
+        "for visibility-gated scan/confirm behavior."
+    ),
+)
+def scan_step(
+    step_angle: float = 12.0,
+    settle_time: float = 0.1,
+    speed: float = 0.35,
+    frame_timeout: float = 0.8,
+    stable_frames: int = 1,
+):
+    """Rotate a small step, then capture a fresh frame and heading.
+
+    Args:
+        step_angle: Relative turn in degrees (positive=CCW, negative=CW).
+        settle_time: Optional extra wait after turn before frame capture.
+        speed: Angular speed in rad/s.
+        frame_timeout: Seconds to wait for a fresh frame.
+        stable_frames: Number of distinct new frames to wait for (1 or 2).
+    """
+    import time as _time
+
+    bridge = _get_bridge()
+
+    turn_result = bridge.turn(angle_deg=step_angle, angular_speed=speed)
+
+    if settle_time > 0:
+        _time.sleep(settle_time)
+
+    image_bytes, timestamp = bridge.wait_for_fresh_frame(
+        timeout=max(0.2, frame_timeout),
+        min_new_frames=max(1, int(stable_frames)),
+        poll_interval=0.03,
+    )
+
+    odom = bridge.get_odom()
+    heading = round(odom["orientation_yaw_deg"], 1) if odom else None
+
+    if image_bytes is None:
+        payload = {
+            "success": bool(turn_result and turn_result.get("success")),
+            "heading_deg": heading,
+            "turn": turn_result,
+            "frame": "missing",
+            "timestamp": timestamp,
+        }
+        return json.dumps(payload, default=_json_default)
+
+    try:
+        bridge.add_search_frame(image_bytes, heading if heading is not None else 0.0)
+    except Exception:
+        pass
+
+    summary = {
+        "success": bool(turn_result and turn_result.get("success")),
+        "heading_deg": heading,
+        "turn": turn_result,
+        "frame": "ok",
+        "timestamp": timestamp,
+    }
+    return [json.dumps(summary, default=_json_default), Image(data=image_bytes, format="jpeg")]
+
+@mcp.tool(
     title="Rotate and Scan (360° survey)",
     description=(
         "Perform a full 360° rotation and return a SINGLE image surveying "
@@ -772,7 +843,7 @@ def _stitch_panorama(
 def rotate_and_scan(
     total_angle: float = 360.0,
     step_angle: float = 24.0,
-    settle_time: float = 0.3,
+    settle_time: float = 0.2,
     speed: float = 0.3,
 ):
     """Rotate and capture camera frames at each step, returning a panorama.
@@ -857,7 +928,11 @@ def rotate_and_scan(
             _time.sleep(settle_time)
 
         # Wait for a genuinely fresh frame
-        image_bytes, timestamp = bridge.wait_for_fresh_frame(timeout=1.5)
+        image_bytes, timestamp = bridge.wait_for_fresh_frame(
+            timeout=1.0,
+            min_new_frames=1,
+            poll_interval=0.03,
+        )
 
         if image_bytes is not None:
             raw_frames.append(image_bytes)
@@ -977,7 +1052,11 @@ def look_for_target(
     prev_yaw = _math.radians(odom0["orientation_yaw_deg"]) if odom0 else 0.0
 
     # Capture first frame at the start position
-    image_bytes, _ = bridge.wait_for_fresh_frame(timeout=1.5)
+    image_bytes, _ = bridge.wait_for_fresh_frame(
+        timeout=1.0,
+        min_new_frames=1,
+        poll_interval=0.03,
+    )
     if image_bytes is not None:
         raw_frames.append(image_bytes)
         odom_now = bridge.get_odom()
@@ -1012,7 +1091,11 @@ def look_for_target(
         if settle_time > 0:
             _time.sleep(settle_time)
 
-        image_bytes, _ = bridge.wait_for_fresh_frame(timeout=1.5)
+        image_bytes, _ = bridge.wait_for_fresh_frame(
+            timeout=1.0,
+            min_new_frames=1,
+            poll_interval=0.03,
+        )
         if image_bytes is not None:
             raw_frames.append(image_bytes)
         else:
@@ -1159,8 +1242,8 @@ def run(
 
     logger.info(f"Starting TurtleBot3 MCP Server at {host}:{port}{path}")
     logger.info(
-        "10 Tools: get_camera_image, get_lidar_scan, get_odometry, check_path_clear, "
-        "move_forward, turn, navigate_safely, stop, open_camera_viewer, diagnose_ros"
+        "11 Tools: get_camera_image, get_lidar_scan, get_odometry, check_path_clear, "
+        "move_forward, turn, navigate_safely, stop, open_camera_viewer, diagnose_ros, scan_step"
     )
 
     if not verbose:
