@@ -89,6 +89,11 @@ DEFAULT_SAFETY_MARGIN_M = 0.25
 # Default camera viewer port
 DEFAULT_VIEWER_PORT = 18280
 
+# LiDAR orientation calibration (degrees).
+# Use this when sensor-frame 0° is not aligned with robot forward in the UI.
+# Negative rotates clockwise, positive rotates counter-clockwise.
+LIDAR_FRAME_ROTATION_DEG = -90.0
+
 # Progressive scan performance tuning
 MAX_SEARCH_FRAMES = 36
 SEARCH_FRAME_MIN_HEADING_DELTA_DEG = 4.0
@@ -525,10 +530,14 @@ _VIEWER_HTML = """
             }
             toolLogsEl.innerHTML = logs.slice().reverse().map(function(item) {
                 var args = item.args && Object.keys(item.args).length ? JSON.stringify(item.args) : '{}';
+                var argWhy = item.arg_reasons && Object.keys(item.arg_reasons).length
+                    ? JSON.stringify(item.arg_reasons)
+                    : '{}';
                 return '<li>' +
                     '<div><span class="tool">' + item.tool + '</span> <span class="ts">' + (item.timestamp || '') + '</span></div>' +
                     '<div class="reason">' + (item.reason || 'No reason provided') + '</div>' +
                     '<div class="args">args: ' + args + '</div>' +
+                    '<div class="args">arg why: ' + argWhy + '</div>' +
                     '</li>';
             }).join('');
         }
@@ -1447,12 +1456,17 @@ class TurtleBot3Bridge:
         with self._perf_lock:
             return dict(self._perf_stats)
 
-    def record_tool_call(self, tool_name: str, reason: str, args: dict | None = None):
+    def record_tool_call(self,
+                         tool_name: str,
+                         reason: str,
+                         args: dict | None = None,
+                         arg_reasons: dict | None = None):
         entry = {
             "timestamp": datetime.now().isoformat(timespec='seconds'),
             "tool": tool_name,
             "reason": reason,
             "args": args or {},
+            "arg_reasons": arg_reasons or {},
         }
         with self._tool_trace_lock:
             self._tool_trace.append(entry)
@@ -1480,12 +1494,22 @@ class TurtleBot3Bridge:
                 "message": "Empty LiDAR scan",
             }
 
+        angle_min = float(scan.get("angle_min", 0.0))
+        angle_increment = float(scan.get("angle_increment", 0.0))
+
+        lidar_rotation_rad = math.radians(LIDAR_FRAME_ROTATION_DEG)
+
+        def _beam_angle_deg(index: int) -> float:
+            beam_rad = angle_min + index * angle_increment
+            deg = (math.degrees(beam_rad) + LIDAR_FRAME_ROTATION_DEG) % 360.0
+            return deg
+
         def _slice_stats(center_deg: float, half_width_deg: float = 30.0):
             valid = []
             for idx, value in enumerate(ranges):
                 if value <= 0 or math.isinf(value):
                     continue
-                angle = (idx / total) * 360.0
+                angle = _beam_angle_deg(idx)
                 diff = abs(angle - center_deg)
                 if diff > 180.0:
                     diff = 360.0 - diff
@@ -1517,14 +1541,14 @@ class TurtleBot3Bridge:
                 if distance <= 0 or math.isinf(distance):
                     continue
 
-                local_angle_rad = (idx / total) * 2.0 * math.pi
+                local_angle_rad = angle_min + idx * angle_increment + lidar_rotation_rad
                 world_angle_rad = robot_heading_rad + local_angle_rad
                 world_x = robot_x + distance * math.cos(world_angle_rad)
                 world_y = robot_y + distance * math.sin(world_angle_rad)
 
                 sampled_points.append({
                     "distance_m": round(float(distance), 3),
-                    "angle_deg": round((idx / total) * 360.0, 1),
+                    "angle_deg": round(_beam_angle_deg(idx), 1),
                     "world_x_m": round(world_x, 3),
                     "world_y_m": round(world_y, 3),
                 })

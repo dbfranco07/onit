@@ -24,6 +24,8 @@ import json
 import os
 import sys
 import logging
+import threading
+import time
 
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
@@ -42,6 +44,71 @@ mcp = FastMCP("TurtleBot3 MCP Server")
 # Lazy singleton reference — initialised in run()
 _bridge = None
 
+_front_check_guard_lock = threading.Lock()
+_front_check_guard = {
+    "checks_since_motion": 0,
+    "last_result": None,
+    "last_threshold": None,
+    "last_timestamp": 0.0,
+}
+
+FRONT_CHECK_MAX_WITHOUT_MOTION = 2
+FRONT_CHECK_CACHE_TTL_S = 2.0
+
+
+def _reset_front_check_guard() -> None:
+    with _front_check_guard_lock:
+        _front_check_guard["checks_since_motion"] = 0
+        _front_check_guard["last_result"] = None
+        _front_check_guard["last_threshold"] = None
+        _front_check_guard["last_timestamp"] = 0.0
+
+
+def _mark_motion_if_success(result: dict) -> None:
+    """Reset front-check throttling after successful movement/rotation."""
+    if not isinstance(result, dict):
+        return
+
+    status = str(result.get("status", "")).lower()
+    if status in ("ok", "success", "completed", "stopped"):
+        _reset_front_check_guard()
+
+
+def _should_reuse_front_check(threshold_m: float) -> dict | None:
+    """Return cached front check result when redundant checks should be throttled."""
+    now = time.time()
+    with _front_check_guard_lock:
+        checks_since_motion = _front_check_guard["checks_since_motion"]
+        last_result = _front_check_guard["last_result"]
+        last_threshold = _front_check_guard["last_threshold"]
+        last_timestamp = _front_check_guard["last_timestamp"]
+
+    if checks_since_motion < FRONT_CHECK_MAX_WITHOUT_MOTION:
+        return None
+    if last_result is None or last_threshold is None:
+        return None
+    if abs(float(last_threshold) - float(threshold_m)) > 1e-6:
+        return None
+    if (now - float(last_timestamp)) > FRONT_CHECK_CACHE_TTL_S:
+        return None
+
+    reused = dict(last_result)
+    reused["cached"] = True
+    reused["suppressed_redundant_check"] = True
+    reused["message"] = (
+        "Reused recent front-clearance result to avoid redundant checks. "
+        "Move or turn before additional front checks."
+    )
+    return reused
+
+
+def _record_front_check_result(threshold_m: float, result: dict) -> None:
+    with _front_check_guard_lock:
+        _front_check_guard["checks_since_motion"] += 1
+        _front_check_guard["last_result"] = result
+        _front_check_guard["last_threshold"] = float(threshold_m)
+        _front_check_guard["last_timestamp"] = time.time()
+
 
 def _get_bridge():
     """Return the TurtleBot3Bridge singleton (must be initialised via run())."""
@@ -53,10 +120,115 @@ def _get_bridge():
     return _bridge
 
 
+def _decision_context(bridge, tool_name: str, args: dict) -> str:
+    """Build a short human-readable rationale for why a tool was chosen."""
+    try:
+        odom = bridge.get_odom() or {}
+        heading = odom.get("orientation_yaw_deg")
+        lin_vel = (odom.get("linear_velocity") or {}).get("x")
+        front_dist = bridge.check_obstacle(direction="front")
+
+        if tool_name in ("move_forward", "navigate_safely"):
+            if front_dist is None:
+                return "forward motion requested; lidar front distance unavailable"
+            if front_dist < 0.3:
+                return f"path appears tight (front≈{front_dist:.2f}m), so cautious forward step"
+            return f"front path appears clear (front≈{front_dist:.2f}m), advancing toward objective"
+
+        if tool_name in ("check_path_clear", "get_lidar_scan"):
+            if front_dist is None:
+                return "need environment clearance estimate before movement"
+            return f"safety/route check before action (front≈{front_dist:.2f}m)"
+
+        if tool_name in ("turn", "turn_to_heading"):
+            if heading is None:
+                return "heading adjustment requested by navigation plan"
+            return f"heading alignment for next step (current heading≈{heading:.1f}°)"
+
+        if tool_name in ("scan_step", "rotate_and_scan", "look_for_target", "get_camera_image"):
+            if lin_vel is not None and abs(lin_vel) > 0.02:
+                return "visual update while robot is in motion"
+            return "visual search/confirmation needed for target or scene understanding"
+
+        if tool_name == "stop":
+            return "stop requested for safety or completion condition"
+
+        if tool_name == "get_odometry":
+            return "pose/heading verification after movement decision"
+
+        return "selected by current task plan"
+    except Exception:
+        return "selected by current task plan"
+
+
+def _argument_context(bridge, tool_name: str, args: dict) -> dict:
+    """Build per-argument rationale for operator-facing trace logs."""
+    reasons = {}
+    if not args:
+        return reasons
+
+    try:
+        front_dist = bridge.check_obstacle(direction="front")
+    except Exception:
+        front_dist = None
+
+    if tool_name in ("move_forward", "navigate_safely"):
+        if "distance" in args:
+            dist = args.get("distance")
+            if front_dist is not None:
+                if front_dist < 0.3:
+                    reasons["distance"] = f"short step due to nearby obstacle (front≈{front_dist:.2f}m)"
+                elif front_dist < 1.0:
+                    reasons["distance"] = f"moderate step for partial clearance (front≈{front_dist:.2f}m)"
+                else:
+                    reasons["distance"] = f"longer stride is safe (front≈{front_dist:.2f}m)"
+            else:
+                reasons["distance"] = f"default/planned motion step ({dist})"
+        if "speed" in args:
+            reasons["speed"] = "chosen to balance stability and safety for indoor navigation"
+        if "obstacle_threshold_m" in args:
+            reasons["obstacle_threshold_m"] = "safety margin for triggering obstacle avoidance"
+
+    elif tool_name == "check_path_clear":
+        if "direction" in args:
+            reasons["direction"] = "requested movement/planning direction to validate"
+        if "threshold_m" in args:
+            reasons["threshold_m"] = "minimum acceptable clearance before movement"
+
+    elif tool_name in ("turn", "turn_to_heading"):
+        if "angle" in args:
+            reasons["angle"] = "relative heading correction needed for next navigation step"
+        if "target_heading_deg" in args:
+            reasons["target_heading_deg"] = "absolute heading from scan-based target/location estimate"
+        if "speed" in args:
+            reasons["speed"] = "moderate angular speed to reduce overshoot"
+
+    elif tool_name in ("scan_step", "rotate_and_scan", "look_for_target"):
+        if "step_angle" in args:
+            reasons["step_angle"] = "scan resolution tradeoff: smaller is more precise, larger is faster"
+        if "total_angle" in args:
+            reasons["total_angle"] = "scan coverage requested by current search objective"
+        if "sweep_width_deg" in args:
+            reasons["sweep_width_deg"] = "focused search arc around likely target heading"
+
+    elif tool_name == "open_camera_viewer" and "port" in args:
+        reasons["port"] = "viewer server port for operator monitoring"
+
+    return reasons
+
+
 def _trace_tool_call(tool_name: str, reason: str, args: dict | None = None) -> None:
     try:
         bridge = _get_bridge()
-        bridge.record_tool_call(tool_name=tool_name, reason=reason, args=args or {})
+        payload_args = args or {}
+        why = _decision_context(bridge, tool_name=tool_name, args=payload_args)
+        arg_reasons = _argument_context(bridge, tool_name=tool_name, args=payload_args)
+        bridge.record_tool_call(
+            tool_name=tool_name,
+            reason=f"{reason} Why: {why}",
+            args=payload_args,
+            arg_reasons=arg_reasons,
+        )
     except Exception:
         pass
 
@@ -233,6 +405,7 @@ def move_forward(
     })
     bridge = _get_bridge()
     result = bridge.move_forward(distance_m=distance, speed=speed)
+    _mark_motion_if_success(result)
     return json.dumps(result, indent=2, default=_json_default)
 
 
@@ -266,6 +439,7 @@ def turn(
     })
     bridge = _get_bridge()
     result = bridge.turn(angle_deg=angle, angular_speed=speed)
+    _mark_motion_if_success(result)
     return json.dumps(result, indent=2, default=_json_default)
 
 
@@ -297,6 +471,7 @@ def turn_to_heading(
     })
     bridge = _get_bridge()
     result = bridge.turn_to_heading(target_deg=target_heading_deg)
+    _mark_motion_if_success(result)
     return json.dumps(result, indent=2, default=_json_default)
 
 
@@ -312,6 +487,7 @@ def stop() -> str:
     _trace_tool_call("stop", "Immediate halt for safety or task completion.")
     bridge = _get_bridge()
     bridge.stop()
+    _reset_front_check_guard()
     odom = bridge.get_odom()
     pos = odom or {}
     return json.dumps({
@@ -355,8 +531,18 @@ def check_path_clear(
         "direction": direction,
         "threshold_m": threshold_m,
     })
+
+    if direction == "front":
+        reused = _should_reuse_front_check(threshold_m=threshold_m)
+        if reused is not None:
+            return json.dumps(reused, indent=2, default=_json_default)
+
     bridge = _get_bridge()
     result = bridge.check_path_clear(direction=direction, threshold_m=threshold_m)
+
+    if direction == "front" and isinstance(result, dict):
+        _record_front_check_result(threshold_m=threshold_m, result=result)
+
     return json.dumps(result, indent=2, default=_json_default)
 
 
@@ -399,6 +585,7 @@ def navigate_safely(
         speed=speed,
         obstacle_threshold_m=obstacle_threshold_m,
     )
+    _mark_motion_if_success(result)
     return json.dumps(result, indent=2, default=_json_default)
 
 

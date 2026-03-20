@@ -46,6 +46,10 @@ instruction_template: |
   3. **Speed limits**: Max 0.22 m/s linear, 2.84 rad/s angular. Use defaults unless asked otherwise.
   4. **Confirm motion**: `get_odometry` after each motion to verify.
   5. **Stop on error**: Call `stop` immediately on any unexpected result.
+  6. **Anti-chatter cadence**:
+     - Do NOT call `check_path_clear("front")` repeatedly without any motion/turn in between.
+     - After a successful forward move, avoid immediate duplicate `check_path_clear` unless the scene changed (new obstacle, turn, or target lost).
+     - For clear paths, avoid excessive micro-steps; prefer fewer larger steps.
 
   ## Task Classification
 
@@ -78,6 +82,10 @@ instruction_template: |
       Success only if BOTH are true:
       1) `check_path_clear("front")` is in **0.45-0.60 m**, and
       2) the requested target is visibly centered in the frame.
+      Additionally, verify with `get_lidar_scan(summarize=true)` that the
+      nearest short-range return is front-dominant (not clearly left/right-dominant).
+      If left/right is significantly nearer than front, do NOT declare success;
+      re-center/reacquire and continue.
 
    - **"Stop in front of X" / "Approach X" / "Go to X"**:
       Success when X is visually confirmed ahead and you are at functional
@@ -171,12 +179,22 @@ instruction_template: |
         - Clear < 0.3 m → `navigate_safely(distance=0.15)` (creep).
         - Blocked → try a small lateral adjustment: turn 15°, move 0.2 m,
           turn back, then reassess.
+            - If the target is visible, centered, and front clearance remains > 1.0 m,
+               do not downgrade to 0.15–0.2 m steps until you are within about 0.8 m.
       2f. `get_camera_image` — verify the SAME target class (e.g., soccer ball)
             is still visible, centered, and appears closer than before.
+                  For stable, clear approaches, camera confirmation every 1–2 forward
+                  moves is acceptable (not necessarily after every single micro-step).
       2g. **Target-lock rule before declaring success**:
             - For tasks like "stop 50 cm away", only stop when BOTH are true:
                (i) `check_path_clear("front")` is near the requested distance,
                AND (ii) the requested target object is clearly in front/center.
+            - For "50 cm away" tasks, also call `get_lidar_scan(summarize=true)`:
+               front sector must be consistent with the near obstacle. If left/right
+               sector is clearly nearer than front, treat this as side obstacle bias,
+               not target lock.
+            - Require **two consecutive confirmation cycles** before declaring success:
+               repeat (camera + front clearance + lidar sector consistency) twice.
             - If distance condition is met but target is not clearly centered,
                treat it as a non-target obstacle. Re-center/reacquire the target
                (`look_for_target` or small corrective turns) and continue.
