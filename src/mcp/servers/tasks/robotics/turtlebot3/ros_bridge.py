@@ -87,6 +87,11 @@ DEFAULT_SAFETY_MARGIN_M = 0.25
 # Default camera viewer port
 DEFAULT_VIEWER_PORT = 18280
 
+# Progressive scan performance tuning
+MAX_SEARCH_FRAMES = 36
+SEARCH_FRAME_MIN_HEADING_DELTA_DEG = 4.0
+MOSAIC_REBUILD_MIN_INTERVAL_S = 0.5
+
 # -----------------------------------------------------------------------
 # MJPEG Camera Viewer — streams live camera feed to the browser
 # -----------------------------------------------------------------------
@@ -575,6 +580,18 @@ class TurtleBot3Bridge:
         # Progressive search frame accumulator (fed by get_camera_image)
         self._search_frames_lock = threading.Lock()
         self._search_frames: list[tuple[bytes, float]] = []  # [(jpeg, heading_deg), ...]
+        self._last_mosaic_rebuild_monotonic = 0.0
+        self._mosaic_rebuild_pending = False
+
+        # Lightweight performance metrics (for profiling/tuning)
+        self._perf_lock = threading.Lock()
+        self._perf_stats = {
+            "mosaic_rebuild_count": 0,
+            "mosaic_rebuild_avg_ms": 0.0,
+            "mosaic_rebuild_last_ms": 0.0,
+            "search_frames_accepted": 0,
+            "search_frames_skipped": 0,
+        }
 
         # QoS for sensor topics (best-effort — matches typical LiDAR/camera publishers)
         sensor_qos = QoSProfile(
@@ -879,16 +896,60 @@ class TurtleBot3Bridge:
         Automatically rebuilds the mosaic for the web viewer so the
         operator can follow along in real time.
         """
+        now = time.monotonic()
+        should_rebuild = False
+
         with self._search_frames_lock:
-            self._search_frames.append((jpeg_bytes, heading_deg))
+            # Deduplicate near-identical heading updates to avoid expensive
+            # contact-sheet rebuilds that add little information.
+            if self._search_frames:
+                _, last_heading = self._search_frames[-1]
+                delta = abs((heading_deg - last_heading + 180.0) % 360.0 - 180.0)
+                if delta < SEARCH_FRAME_MIN_HEADING_DELTA_DEG:
+                    # Keep latest bytes for this heading bucket, do not append.
+                    self._search_frames[-1] = (jpeg_bytes, heading_deg)
+                    with self._perf_lock:
+                        self._perf_stats["search_frames_skipped"] += 1
+                    _stderr(
+                        f"Search frame skipped (Δheading={delta:.1f}° < "
+                        f"{SEARCH_FRAME_MIN_HEADING_DELTA_DEG:.1f}°)"
+                    )
+                else:
+                    self._search_frames.append((jpeg_bytes, heading_deg))
+                    with self._perf_lock:
+                        self._perf_stats["search_frames_accepted"] += 1
+            else:
+                self._search_frames.append((jpeg_bytes, heading_deg))
+                with self._perf_lock:
+                    self._perf_stats["search_frames_accepted"] += 1
+
+            # Bound memory and rebuild cost.
+            if len(self._search_frames) > MAX_SEARCH_FRAMES:
+                self._search_frames = self._search_frames[-MAX_SEARCH_FRAMES:]
+
+            # Throttle rebuild frequency; mark pending updates for next slot.
+            if (
+                now - self._last_mosaic_rebuild_monotonic >= MOSAIC_REBUILD_MIN_INTERVAL_S
+                or len(self._search_frames) <= 2
+            ):
+                should_rebuild = True
+                self._mosaic_rebuild_pending = False
+                self._last_mosaic_rebuild_monotonic = now
+            else:
+                self._mosaic_rebuild_pending = True
+
             frames = list(self._search_frames)
-        _stderr(f"Search frame #{len(frames)} added (heading {heading_deg:.0f}°)")
-        self._rebuild_mosaic_from_frames(frames)
+
+        _stderr(f"Search frame buffer size={len(frames)} (heading {heading_deg:.0f}°)")
+        if should_rebuild:
+            self._rebuild_mosaic_from_frames(frames)
 
     def clear_search_frames(self):
         """Reset the accumulated search frames (new search or relocation)."""
         with self._search_frames_lock:
             self._search_frames.clear()
+            self._mosaic_rebuild_pending = False
+            self._last_mosaic_rebuild_monotonic = 0.0
         _stderr("Search frames cleared")
 
     def _rebuild_mosaic_from_frames(self, frames: list[tuple[bytes, float]]):
@@ -900,6 +961,7 @@ class TurtleBot3Bridge:
         all seam / ghosting artefacts.
         """
         try:
+            t0 = time.monotonic()
             from PIL import Image, ImageDraw, ImageFont
             import io, math
 
@@ -986,8 +1048,27 @@ class TurtleBot3Bridge:
             buf = io.BytesIO()
             sheet.save(buf, format="JPEG", quality=85)
             self.set_mosaic(buf.getvalue())
+
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            with self._perf_lock:
+                count = self._perf_stats["mosaic_rebuild_count"] + 1
+                prev_avg = self._perf_stats["mosaic_rebuild_avg_ms"]
+                self._perf_stats["mosaic_rebuild_count"] = count
+                self._perf_stats["mosaic_rebuild_last_ms"] = round(elapsed_ms, 2)
+                self._perf_stats["mosaic_rebuild_avg_ms"] = round(
+                    ((prev_avg * (count - 1)) + elapsed_ms) / count, 2
+                )
         except Exception as exc:
             _stderr(f"WARNING: contact sheet rebuild failed: {exc}")
+
+    def get_performance_snapshot(self):
+        """Return lightweight bridge performance stats for tuning.
+
+        Returns:
+            dict: Current snapshot of mosaic/search performance counters.
+        """
+        with self._perf_lock:
+            return dict(self._perf_stats)
 
     @property
     def camera_viewer_url(self):
