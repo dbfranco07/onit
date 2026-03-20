@@ -53,6 +53,14 @@ def _get_bridge():
     return _bridge
 
 
+def _trace_tool_call(tool_name: str, reason: str, args: dict | None = None) -> None:
+    try:
+        bridge = _get_bridge()
+        bridge.record_tool_call(tool_name=tool_name, reason=reason, args=args or {})
+    except Exception:
+        pass
+
+
 # =========================================================================
 # SENSOR TOOLS
 # =========================================================================
@@ -69,6 +77,7 @@ def _get_bridge():
 )
 def get_camera_image() -> Image:
     """Return a fresh compressed camera image as ImageContent."""
+    _trace_tool_call("get_camera_image", "Capture latest scene for perception/update.")
     bridge = _get_bridge()
     # wait_for_fresh_frame blocks until a frame newer than the current
     # cached one arrives, avoiding stale / motion-blurred images.
@@ -115,6 +124,7 @@ def get_lidar_scan(
         summarize: If True (default), return a compact summary with min/max/avg
             per quadrant instead of the full 360-sample array.
     """
+    _trace_tool_call("get_lidar_scan", "Read obstacle distances around the robot.", {"summarize": summarize})
     bridge = _get_bridge()
     scan = bridge.get_lidar()
 
@@ -162,6 +172,7 @@ def get_lidar_scan(
 )
 def get_odometry() -> str:
     """Return current odometry as JSON."""
+    _trace_tool_call("get_odometry", "Read robot pose/velocity for localization feedback.")
     bridge = _get_bridge()
     odom = bridge.get_odom()
 
@@ -216,6 +227,10 @@ def move_forward(
     if speed <= 0:
         return json.dumps({"error": "Speed must be positive.", "status": "failed"})
 
+    _trace_tool_call("move_forward", "Advance toward goal in controlled forward motion.", {
+        "distance": distance,
+        "speed": speed,
+    })
     bridge = _get_bridge()
     result = bridge.move_forward(distance_m=distance, speed=speed)
     return json.dumps(result, indent=2, default=_json_default)
@@ -245,6 +260,10 @@ def turn(
     if angle == 0:
         return json.dumps({"error": "Angle must be non-zero.", "status": "failed"})
 
+    _trace_tool_call("turn", "Adjust heading with relative rotation.", {
+        "angle": angle,
+        "speed": speed,
+    })
     bridge = _get_bridge()
     result = bridge.turn(angle_deg=angle, angular_speed=speed)
     return json.dumps(result, indent=2, default=_json_default)
@@ -273,6 +292,9 @@ def turn_to_heading(
             180=South, 270=West). Uses the same coordinate frame as odometry
             and rotate_and_scan headings.
     """
+    _trace_tool_call("turn_to_heading", "Face target heading from scan/navigation plan.", {
+        "target_heading_deg": target_heading_deg,
+    })
     bridge = _get_bridge()
     result = bridge.turn_to_heading(target_deg=target_heading_deg)
     return json.dumps(result, indent=2, default=_json_default)
@@ -287,6 +309,7 @@ def turn_to_heading(
 )
 def stop() -> str:
     """Send an immediate stop command."""
+    _trace_tool_call("stop", "Immediate halt for safety or task completion.")
     bridge = _get_bridge()
     bridge.stop()
     odom = bridge.get_odom()
@@ -328,6 +351,10 @@ def check_path_clear(
             "error": f"Invalid direction '{direction}'. Use front/left/right/back.",
         })
 
+    _trace_tool_call("check_path_clear", "Verify clearance before motion step.", {
+        "direction": direction,
+        "threshold_m": threshold_m,
+    })
     bridge = _get_bridge()
     result = bridge.check_path_clear(direction=direction, threshold_m=threshold_m)
     return json.dumps(result, indent=2, default=_json_default)
@@ -361,6 +388,11 @@ def navigate_safely(
     if speed <= 0:
         return json.dumps({"error": "Speed must be positive.", "status": "failed"})
 
+    _trace_tool_call("navigate_safely", "Move with automatic obstacle avoidance.", {
+        "distance": distance,
+        "speed": speed,
+        "obstacle_threshold_m": obstacle_threshold_m,
+    })
     bridge = _get_bridge()
     result = bridge.navigate_safely(
         distance_m=distance,
@@ -391,6 +423,7 @@ def open_camera_viewer(
     Args:
         port: HTTP port for the viewer (default: 18280).
     """
+    _trace_tool_call("open_camera_viewer", "Open operator visual monitor for robot view.", {"port": port})
     bridge = _get_bridge()
 
     try:
@@ -426,6 +459,7 @@ def open_camera_viewer(
 )
 def diagnose_ros() -> str:
     """Return detailed ROS 2 diagnostic information."""
+    _trace_tool_call("diagnose_ros", "Collect ROS connectivity/health diagnostics.")
     diag = {}
 
     # Environment
@@ -781,6 +815,11 @@ def scan_step(
     """
     import time as _time
 
+    _trace_tool_call("scan_step", "Progressive search step with immediate visual check.", {
+        "step_angle": step_angle,
+        "settle_time": settle_time,
+        "speed": speed,
+    })
     bridge = _get_bridge()
 
     turn_result = bridge.turn(angle_deg=step_angle, angular_speed=speed)
@@ -862,6 +901,10 @@ def rotate_and_scan(
     import time as _time
     import math as _math
 
+    _trace_tool_call("rotate_and_scan", "Perform full-area visual survey for targets/obstacles.", {
+        "total_angle": total_angle,
+        "step_angle": step_angle,
+    })
     bridge = _get_bridge()
 
     # Positive total_angle → CCW (positive turn angles)
@@ -1025,6 +1068,10 @@ def look_for_target(
     import time as _time
     import math as _math
 
+    _trace_tool_call("look_for_target", "Re-acquire target in focused heading window.", {
+        "heading_deg": heading_deg,
+        "sweep_width_deg": sweep_width_deg,
+    })
     bridge = _get_bridge()
 
     # --- Position at sweep start: heading - sweep_width/2 ---

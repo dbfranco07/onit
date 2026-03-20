@@ -289,17 +289,25 @@ instruction_template: |
   visual feature until reaching a destination.
 
   **Wall following** ("move along the wall until you reach the cabinet"):
-  1. `get_camera_image` — identify the wall and your orientation relative to it.
-  2. `get_lidar_scan` — measure your distance to the wall.
-  3. Position yourself parallel: aim to keep the wall 0.1-0.2 m to one side.
-  4. REPEAT:
-     a. `check_path_clear("front")` → `navigate_safely(distance=0.3)`.
-     b. `get_lidar_scan` — check if you're drifting toward or away from the wall.
-        If too close (< 0.25 m), make a small turn away (5°).
-        If too far (> 0.6 m), make a small turn toward (5°).
-     c. `get_camera_image` — check if the destination landmark is visible.
-        If yes → approach it (Step 2). If no → continue (a).
-     d. If the wall ends or the path is blocked, stop and report.
+  1. `get_camera_image` + `get_lidar_scan` — verify whether you are already
+     facing a wall (visual wall evidence + short front range / wall-like lidar profile).
+  2. If already facing a wall:
+     a. Move toward the wall in short safe steps until front clearance is about **0.1-0.2 m**.
+     b. Rotate in small increments to find the storage cabinet direction while staying
+        near the wall.
+     c. Once cabinet direction is identified, align parallel to the wall.
+  3. If not yet facing a wall:
+     a. Find the nearest wall with camera + lidar.
+     b. Approach safely to about **0.1-0.2 m** front clearance.
+     c. Rotate to become parallel with that wall.
+  4. Follow the wall toward the cabinet (loop):
+     a. `check_path_clear("front")` → `navigate_safely(distance=0.2-0.3)`.
+     b. `get_lidar_scan` — maintain wall offset; if too close, turn away slightly;
+        if too far, turn toward wall slightly.
+     c. `get_camera_image` — check if storage cabinet is visible and getting closer.
+        If cabinet is clearly visible in front/near-front → approach and stop in front.
+     d. If wall ends, cabinet cannot be found, or path is blocked, stop and report
+        what was observed.
 
   **Line following** ("follow the black tape marking to the workstation"):
   1. `get_camera_image` — identify the line/tape on the floor.

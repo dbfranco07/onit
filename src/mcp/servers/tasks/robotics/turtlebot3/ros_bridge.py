@@ -14,6 +14,7 @@ Usage:
 """
 
 import math
+import json
 import os
 import sys
 import time
@@ -26,6 +27,7 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from io import BytesIO
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -273,9 +275,84 @@ _VIEWER_HTML = """
     .controls button:hover { background: #333; border-color: #888; }
     .feed-container {
       position: relative;
-      width: 100%; max-width: 960px;
+            width: 100%; max-width: 920px;
       display: flex; justify-content: center;
     }
+        .layout {
+            width: 100%; max-width: 1500px;
+            display: flex; gap: 14px;
+            align-items: flex-start;
+            justify-content: center;
+        }
+        .panel {
+            width: min(430px, 96vw);
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 10px;
+            font-size: 0.86em;
+            line-height: 1.35;
+        }
+        .panel h2 {
+            font-size: 1em;
+            margin-bottom: 8px;
+            color: #fff;
+        }
+        .overview {
+            color: #c9e6ff;
+            margin-bottom: 10px;
+            min-height: 38px;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px 10px;
+            margin-bottom: 10px;
+        }
+        .k { color: #9aa0a6; }
+        .v { color: #e8eaed; }
+        .subsection {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid #2f2f2f;
+        }
+        .plan-wrap {
+            width: 100%;
+            background: #101214;
+            border: 1px solid #2f2f2f;
+            border-radius: 4px;
+            padding: 6px;
+        }
+        #planCanvas {
+            width: 100%;
+            height: 200px;
+            border-radius: 4px;
+            display: block;
+            background: #0d1013;
+        }
+        .plan-meta {
+            margin-top: 6px;
+            color: #9aa0a6;
+            font-size: 0.9em;
+        }
+        ul.logs {
+            list-style: none;
+            margin: 6px 0 0;
+            padding: 0;
+            max-height: 310px;
+            overflow: auto;
+        }
+        ul.logs li {
+            border: 1px solid #2f2f2f;
+            border-radius: 4px;
+            padding: 6px;
+            margin-bottom: 6px;
+            background: #151515;
+        }
+        .tool { color: #ffd580; font-weight: 600; }
+        .ts { color: #9aa0a6; font-size: 0.9em; }
+        .reason { color: #d0e8d0; }
+        .args { color: #b6c3d1; font-size: 0.92em; }
     #cam {
       width: 100%; max-height: 80vh;
       object-fit: contain;
@@ -292,8 +369,12 @@ _VIEWER_HTML = """
       0%, 100% { opacity: 1; }
       50% { opacity: 0.4; }
     }
-    .fullscreen .feed-container { max-width: none; }
+        .fullscreen .feed-container { max-width: none; }
     .fullscreen #cam { max-height: 100vh; border: none; border-radius: 0; }
+        @media (max-width: 1200px) {
+            .layout { flex-direction: column; align-items: center; }
+            .panel { width: min(920px, 96vw); }
+        }
   </style>
 </head>
 <body>
@@ -310,8 +391,48 @@ _VIEWER_HTML = """
     <button onclick="takeSnapshot()" title="Save current frame (S)">&#128247; Snapshot</button>
     <button onclick="toggleFullscreen()" title="Toggle fullscreen (F)">&#x26F6; Fullscreen</button>
   </div>
-  <div class="feed-container">
-    <img id="cam" src="/stream" alt="Camera feed" />
+    <div class="layout">
+        <div class="feed-container">
+            <img id="cam" src="/stream" alt="Camera feed" />
+        </div>
+        <aside class="panel">
+            <h2>Runtime Overview</h2>
+            <div id="overview" class="overview">Waiting for status…</div>
+
+            <div class="subsection">
+                <h2>Pose</h2>
+                <div class="grid">
+                    <div class="k">X</div><div class="v" id="poseX">—</div>
+                    <div class="k">Y</div><div class="v" id="poseY">—</div>
+                    <div class="k">Heading</div><div class="v" id="poseHeading">—</div>
+                    <div class="k">Linear</div><div class="v" id="poseLinear">—</div>
+                    <div class="k">Angular</div><div class="v" id="poseAngular">—</div>
+                </div>
+            </div>
+
+            <div class="subsection">
+                <h2>LiDAR Summary</h2>
+                <div class="grid">
+                    <div class="k">Front min</div><div class="v" id="lidarFront">—</div>
+                    <div class="k">Left min</div><div class="v" id="lidarLeft">—</div>
+                    <div class="k">Right min</div><div class="v" id="lidarRight">—</div>
+                    <div class="k">Back min</div><div class="v" id="lidarBack">—</div>
+                </div>
+            </div>
+
+            <div class="subsection">
+                <h2>Plan Position</h2>
+                <div class="plan-wrap">
+                    <canvas id="planCanvas" width="400" height="200"></canvas>
+                    <div class="plan-meta" id="planMeta">Waiting for odometry…</div>
+                </div>
+            </div>
+
+            <div class="subsection">
+                <h2>Recent Tool Calls</h2>
+                <ul id="toolLogs" class="logs"></ul>
+            </div>
+        </aside>
   </div>
   <script>
     var img = document.getElementById('cam');
@@ -320,6 +441,24 @@ _VIEWER_HTML = """
     var resSp = document.getElementById('res');
     var dot = document.getElementById('liveDot');
     var frames = 0, lastTime = performance.now(), fpsVal = 0;
+
+    var overviewEl = document.getElementById('overview');
+    var poseXEl = document.getElementById('poseX');
+    var poseYEl = document.getElementById('poseY');
+    var poseHeadingEl = document.getElementById('poseHeading');
+    var poseLinearEl = document.getElementById('poseLinear');
+    var poseAngularEl = document.getElementById('poseAngular');
+
+    var lidarFrontEl = document.getElementById('lidarFront');
+    var lidarLeftEl = document.getElementById('lidarLeft');
+    var lidarRightEl = document.getElementById('lidarRight');
+    var lidarBackEl = document.getElementById('lidarBack');
+
+    var toolLogsEl = document.getElementById('toolLogs');
+    var planCanvas = document.getElementById('planCanvas');
+    var planCtx = planCanvas.getContext('2d');
+    var planMetaEl = document.getElementById('planMeta');
+    var planTrail = [];
 
     img.onload = function() {
       frames++;
@@ -356,6 +495,221 @@ _VIEWER_HTML = """
       if (e.key === 'f' || e.key === 'F') toggleFullscreen();
       if (e.key === 's' || e.key === 'S') takeSnapshot();
     });
+
+        function fmtM(v) {
+            if (v === null || v === undefined) return '—';
+            return v.toFixed ? v.toFixed(2) + ' m' : String(v) + ' m';
+        }
+
+        function updateStatusPanel(status) {
+            overviewEl.textContent = status.overview || 'No overview available';
+
+            var pose = status.pose || {};
+            poseXEl.textContent = pose.x_m !== undefined ? pose.x_m.toFixed(3) + ' m' : '—';
+            poseYEl.textContent = pose.y_m !== undefined ? pose.y_m.toFixed(3) + ' m' : '—';
+            poseHeadingEl.textContent = pose.heading_deg !== undefined ? pose.heading_deg.toFixed(1) + '°' : '—';
+            poseLinearEl.textContent = pose.linear_m_s !== undefined ? pose.linear_m_s.toFixed(3) + ' m/s' : '—';
+            poseAngularEl.textContent = pose.angular_rad_s !== undefined ? pose.angular_rad_s.toFixed(3) + ' rad/s' : '—';
+            updatePlanPosition(pose, status.lidar || {});
+
+            var sectors = (((status.lidar || {}).sectors) || {});
+            lidarFrontEl.textContent = fmtM((sectors.front || {}).min_m);
+            lidarLeftEl.textContent = fmtM((sectors.left || {}).min_m);
+            lidarRightEl.textContent = fmtM((sectors.right || {}).min_m);
+            lidarBackEl.textContent = fmtM((sectors.back || {}).min_m);
+
+            var logs = status.recent_tools || [];
+            if (!logs.length) {
+                toolLogsEl.innerHTML = '<li><span class="reason">No tool calls yet.</span></li>';
+                return;
+            }
+            toolLogsEl.innerHTML = logs.slice().reverse().map(function(item) {
+                var args = item.args && Object.keys(item.args).length ? JSON.stringify(item.args) : '{}';
+                return '<li>' +
+                    '<div><span class="tool">' + item.tool + '</span> <span class="ts">' + (item.timestamp || '') + '</span></div>' +
+                    '<div class="reason">' + (item.reason || 'No reason provided') + '</div>' +
+                    '<div class="args">args: ' + args + '</div>' +
+                    '</li>';
+            }).join('');
+        }
+
+        function drawArrow(ctx, x, y, angleRad, color) {
+            var len = 16;
+            var hx = x + Math.cos(angleRad) * len;
+            var hy = y - Math.sin(angleRad) * len;
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            ctx.lineTo(hx, hy);
+            ctx.stroke();
+
+            var head = 6;
+            var a1 = angleRad + Math.PI * 0.82;
+            var a2 = angleRad - Math.PI * 0.82;
+            ctx.beginPath();
+            ctx.moveTo(hx, hy);
+            ctx.lineTo(hx + Math.cos(a1) * head, hy - Math.sin(a1) * head);
+            ctx.lineTo(hx + Math.cos(a2) * head, hy - Math.sin(a2) * head);
+            ctx.closePath();
+            ctx.fillStyle = color;
+            ctx.fill();
+        }
+
+        function updatePlanPosition(pose, lidar) {
+            if (pose.x_m === undefined || pose.y_m === undefined) {
+                return;
+            }
+
+            var x = Number(pose.x_m);
+            var y = Number(pose.y_m);
+            var headingDeg = Number(pose.heading_deg || 0);
+            var headingRad = headingDeg * Math.PI / 180.0;
+            // Display rotation: rotate map 90° so 0° heading is visually "up".
+            var displayRotationRad = Math.PI / 2.0;
+
+            if (!planTrail.length) {
+                planTrail.push({x: x, y: y});
+            } else {
+                var last = planTrail[planTrail.length - 1];
+                var dx = x - last.x;
+                var dy = y - last.y;
+                if (Math.hypot(dx, dy) > 0.01) {
+                    planTrail.push({x: x, y: y});
+                }
+            }
+            if (planTrail.length > 300) {
+                planTrail = planTrail.slice(-300);
+            }
+
+            var pad = 18;
+            var w = planCanvas.width;
+            var h = planCanvas.height;
+
+            var xs = planTrail.map(function(p) { return p.x; });
+            var ys = planTrail.map(function(p) { return p.y; });
+            var minX = Math.min.apply(null, xs);
+            var maxX = Math.max.apply(null, xs);
+            var minY = Math.min.apply(null, ys);
+            var maxY = Math.max.apply(null, ys);
+
+            var lidarPoints = (lidar && lidar.points) ? lidar.points : [];
+
+            // Expand map bounds to include current LiDAR returns around robot.
+            if (lidarPoints.length > 0) {
+                var minLX = Infinity, maxLX = -Infinity;
+                var minLY = Infinity, maxLY = -Infinity;
+                for (var li = 0; li < lidarPoints.length; li++) {
+                    var lp = lidarPoints[li];
+                    if (lp && lp.world_x_m !== undefined && lp.world_y_m !== undefined) {
+                        minLX = Math.min(minLX, lp.world_x_m);
+                        maxLX = Math.max(maxLX, lp.world_x_m);
+                        minLY = Math.min(minLY, lp.world_y_m);
+                        maxLY = Math.max(maxLY, lp.world_y_m);
+                    }
+                }
+                if (minLX !== Infinity) {
+                    minX = Math.min(minX, minLX);
+                    maxX = Math.max(maxX, maxLX);
+                    minY = Math.min(minY, minLY);
+                    maxY = Math.max(maxY, maxLY);
+                }
+            }
+
+            var spanX = Math.max(0.6, maxX - minX);
+            var spanY = Math.max(0.6, maxY - minY);
+            var span = Math.max(spanX, spanY);
+
+            var cx = (minX + maxX) / 2;
+            var cy = (minY + maxY) / 2;
+
+            function toPx(px, py) {
+                var dx = px - cx;
+                var dy = py - cy;
+
+                // Rotate the entire plan view for operator-friendly orientation.
+                var rx = dx * Math.cos(displayRotationRad) - dy * Math.sin(displayRotationRad);
+                var ry = dx * Math.sin(displayRotationRad) + dy * Math.cos(displayRotationRad);
+
+                var nx = (rx + span / 2) / span;
+                var ny = (ry + span / 2) / span;
+                return {
+                    x: pad + nx * (w - 2 * pad),
+                    y: h - (pad + ny * (h - 2 * pad))
+                };
+            }
+
+            planCtx.clearRect(0, 0, w, h);
+
+            planCtx.strokeStyle = '#1f2a34';
+            planCtx.lineWidth = 1;
+            for (var gx = 0; gx <= 4; gx++) {
+                var xx = pad + (gx / 4) * (w - 2 * pad);
+                planCtx.beginPath();
+                planCtx.moveTo(xx, pad);
+                planCtx.lineTo(xx, h - pad);
+                planCtx.stroke();
+            }
+            for (var gy = 0; gy <= 4; gy++) {
+                var yy = pad + (gy / 4) * (h - 2 * pad);
+                planCtx.beginPath();
+                planCtx.moveTo(pad, yy);
+                planCtx.lineTo(w - pad, yy);
+                planCtx.stroke();
+            }
+
+            if (planTrail.length >= 2) {
+                planCtx.strokeStyle = '#65d6ff';
+                planCtx.lineWidth = 2;
+                planCtx.beginPath();
+                var p0 = toPx(planTrail[0].x, planTrail[0].y);
+                planCtx.moveTo(p0.x, p0.y);
+                for (var i = 1; i < planTrail.length; i++) {
+                    var pi = toPx(planTrail[i].x, planTrail[i].y);
+                    planCtx.lineTo(pi.x, pi.y);
+                }
+                planCtx.stroke();
+            }
+
+            // Sonar-like obstacle blips from LiDAR returns.
+            if (lidarPoints.length > 0) {
+                planCtx.fillStyle = '#73ff9f';
+                planCtx.strokeStyle = 'rgba(115,255,159,0.22)';
+                planCtx.lineWidth = 1;
+                for (var lj = 0; lj < lidarPoints.length; lj++) {
+                    var point = lidarPoints[lj];
+                    if (!point || point.world_x_m === undefined || point.world_y_m === undefined) {
+                        continue;
+                    }
+                    var pxy = toPx(point.world_x_m, point.world_y_m);
+                    planCtx.beginPath();
+                    planCtx.arc(pxy.x, pxy.y, 1.8, 0, Math.PI * 2);
+                    planCtx.fill();
+                }
+            }
+
+            var cur = toPx(x, y);
+            planCtx.beginPath();
+            planCtx.arc(cur.x, cur.y, 5, 0, Math.PI * 2);
+            planCtx.fillStyle = '#ffcc66';
+            planCtx.fill();
+            drawArrow(planCtx, cur.x, cur.y, headingRad + displayRotationRad, '#ffcc66');
+
+            planMetaEl.textContent =
+                'Position: (' + x.toFixed(2) + ', ' + y.toFixed(2) + ') m | Heading: ' + headingDeg.toFixed(1) + '° | Trail: ' + planTrail.length + ' | LiDAR blips: ' + lidarPoints.length;
+        }
+
+        function refreshStatus() {
+            fetch('/status?' + Date.now()).then(function(r) {
+                if (!r.ok) throw new Error('status ' + r.status);
+                return r.json();
+            }).then(updateStatusPanel).catch(function() {
+                overviewEl.textContent = 'Status unavailable';
+            });
+        }
+
+        refreshStatus();
+        setInterval(refreshStatus, 1200);
   </script>
 </body>
 </html>
@@ -383,16 +737,20 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == '/' or self.path.startswith('/index'):
+        parsed_path = urlparse(self.path).path
+
+        if parsed_path == '/' or parsed_path.startswith('/index'):
             self._serve_html()
-        elif self.path.startswith('/stream'):
+        elif parsed_path.startswith('/stream'):
             self._serve_mjpeg()
-        elif self.path == '/snapshot':
+        elif parsed_path == '/snapshot':
             self._serve_snapshot()
-        elif self.path == '/mosaic.html':
+        elif parsed_path == '/mosaic.html':
             self._serve_mosaic_html()
-        elif self.path.startswith('/mosaic'):
+        elif parsed_path.startswith('/mosaic'):
             self._serve_mosaic_image()
+        elif parsed_path == '/status':
+            self._serve_status_json()
         else:
             self.send_error(404)
 
@@ -445,6 +803,21 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         self.wfile.write(data)
+
+    def _serve_status_json(self):
+        bridge = self.bridge_ref
+        if bridge is None:
+            self.send_error(503, 'Bridge not ready')
+            return
+
+        payload = bridge.get_operator_status()
+        body = json.dumps(payload).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_mjpeg(self):
         self.send_response(200)
@@ -592,6 +965,10 @@ class TurtleBot3Bridge:
             "search_frames_accepted": 0,
             "search_frames_skipped": 0,
         }
+
+        self._tool_trace_lock = threading.Lock()
+        self._tool_trace: list[dict] = []
+        self._tool_trace_max = 80
 
         # QoS for sensor topics (best-effort — matches typical LiDAR/camera publishers)
         sensor_qos = QoSProfile(
@@ -1069,6 +1446,131 @@ class TurtleBot3Bridge:
         """
         with self._perf_lock:
             return dict(self._perf_stats)
+
+    def record_tool_call(self, tool_name: str, reason: str, args: dict | None = None):
+        entry = {
+            "timestamp": datetime.now().isoformat(timespec='seconds'),
+            "tool": tool_name,
+            "reason": reason,
+            "args": args or {},
+        }
+        with self._tool_trace_lock:
+            self._tool_trace.append(entry)
+            if len(self._tool_trace) > self._tool_trace_max:
+                self._tool_trace = self._tool_trace[-self._tool_trace_max:]
+
+    def get_recent_tool_calls(self, limit: int = 12):
+        with self._tool_trace_lock:
+            return list(self._tool_trace[-max(1, limit):])
+
+    def get_lidar_summary(self):
+        scan = self.get_lidar()
+        odom = self.get_odom()
+        if scan is None:
+            return {
+                "status": "no-data",
+                "message": "No LiDAR data available yet",
+            }
+
+        ranges = scan.get("ranges") or []
+        total = len(ranges)
+        if total == 0:
+            return {
+                "status": "no-data",
+                "message": "Empty LiDAR scan",
+            }
+
+        def _slice_stats(center_deg: float, half_width_deg: float = 30.0):
+            valid = []
+            for idx, value in enumerate(ranges):
+                if value <= 0 or math.isinf(value):
+                    continue
+                angle = (idx / total) * 360.0
+                diff = abs(angle - center_deg)
+                if diff > 180.0:
+                    diff = 360.0 - diff
+                if diff <= half_width_deg:
+                    valid.append(value)
+            if not valid:
+                return {"min_m": None, "avg_m": None}
+            return {
+                "min_m": round(min(valid), 3),
+                "avg_m": round(sum(valid) / len(valid), 3),
+            }
+
+        sectors = {
+            "front": _slice_stats(0.0),
+            "left": _slice_stats(90.0),
+            "back": _slice_stats(180.0),
+            "right": _slice_stats(270.0),
+        }
+
+        sampled_points = []
+        if odom is not None:
+            robot_x = float(odom["position"]["x"])
+            robot_y = float(odom["position"]["y"])
+            robot_heading_rad = float(odom["orientation_yaw_rad"])
+
+            step = max(1, total // 120)
+            for idx in range(0, total, step):
+                distance = ranges[idx]
+                if distance <= 0 or math.isinf(distance):
+                    continue
+
+                local_angle_rad = (idx / total) * 2.0 * math.pi
+                world_angle_rad = robot_heading_rad + local_angle_rad
+                world_x = robot_x + distance * math.cos(world_angle_rad)
+                world_y = robot_y + distance * math.sin(world_angle_rad)
+
+                sampled_points.append({
+                    "distance_m": round(float(distance), 3),
+                    "angle_deg": round((idx / total) * 360.0, 1),
+                    "world_x_m": round(world_x, 3),
+                    "world_y_m": round(world_y, 3),
+                })
+
+        return {
+            "status": "ok",
+            "timestamp": scan.get("timestamp"),
+            "range_limits_m": {
+                "min": scan.get("range_min"),
+                "max": scan.get("range_max"),
+            },
+            "sectors": sectors,
+            "points": sampled_points,
+        }
+
+    def get_operator_status(self):
+        odom = self.get_odom()
+        perf = self.get_performance_snapshot()
+        lidar = self.get_lidar_summary()
+        recent_calls = self.get_recent_tool_calls(limit=10)
+
+        overview = "Idle"
+        if recent_calls:
+            latest = recent_calls[-1]
+            overview = f"Last action: {latest['tool']} — {latest['reason']}"
+        if odom and odom.get("linear_velocity", {}).get("x", 0.0) > 0.02:
+            overview = "Robot moving while monitoring camera/lidar"
+
+        pose = None
+        if odom:
+            pose = {
+                "x_m": round(odom["position"]["x"], 3),
+                "y_m": round(odom["position"]["y"], 3),
+                "heading_deg": round(odom["orientation_yaw_deg"], 1),
+                "linear_m_s": round(odom["linear_velocity"]["x"], 3),
+                "angular_rad_s": round(odom["angular_velocity_z"], 3),
+            }
+
+        return {
+            "timestamp": datetime.now().isoformat(timespec='seconds'),
+            "overview": overview,
+            "pose": pose,
+            "lidar": lidar,
+            "recent_tools": recent_calls,
+            "performance": perf,
+        }
 
     @property
     def camera_viewer_url(self):
