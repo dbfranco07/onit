@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from io import BytesIO
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +358,57 @@ _VIEWER_HTML = """
         .ts { color: #9aa0a6; font-size: 0.9em; }
         .reason { color: #d0e8d0; }
         .args { color: #b6c3d1; font-size: 0.92em; }
+        .args pre {
+            margin-top: 4px;
+            padding: 6px;
+            border: 1px solid #2f2f2f;
+            border-radius: 4px;
+            background: #101214;
+            color: #c8d7e5;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 130px;
+            overflow: auto;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.88em;
+        }
+        ul.scan-list {
+            list-style: none;
+            margin: 6px 0 0;
+            padding: 0;
+            max-height: 280px;
+            overflow: auto;
+        }
+        ul.scan-list li {
+            border: 1px solid #2f2f2f;
+            border-radius: 4px;
+            padding: 6px;
+            margin-bottom: 6px;
+            background: #151515;
+        }
+        .scan-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 6px;
+            color: #9aa0a6;
+            font-size: 0.9em;
+        }
+        .scan-entry img {
+            width: 100%;
+            max-height: 150px;
+            object-fit: contain;
+            border-radius: 4px;
+            border: 1px solid #2f2f2f;
+            background: #0e0e0e;
+            margin-bottom: 6px;
+        }
+        .scan-desc {
+            color: #dce8f3;
+            font-size: 0.92em;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
     #cam {
       width: 100%; max-height: 80vh;
       object-fit: contain;
@@ -426,7 +477,7 @@ _VIEWER_HTML = """
             </div>
 
             <div class="subsection">
-                <h2>Plan Position</h2>
+                <h2>PPI / Sonar Map</h2>
                 <div class="plan-wrap">
                     <canvas id="planCanvas" width="400" height="200"></canvas>
                     <div class="plan-meta" id="planMeta">Waiting for odometry…</div>
@@ -436,6 +487,11 @@ _VIEWER_HTML = """
             <div class="subsection">
                 <h2>Recent Tool Calls</h2>
                 <ul id="toolLogs" class="logs"></ul>
+            </div>
+
+            <div class="subsection">
+                <h2>Scan Frames & Descriptions</h2>
+                <ul id="scanHistory" class="scan-list"></ul>
             </div>
         </aside>
   </div>
@@ -460,6 +516,7 @@ _VIEWER_HTML = """
     var lidarBackEl = document.getElementById('lidarBack');
 
     var toolLogsEl = document.getElementById('toolLogs');
+    var scanHistoryEl = document.getElementById('scanHistory');
     var planCanvas = document.getElementById('planCanvas');
     var planCtx = planCanvas.getContext('2d');
     var planMetaEl = document.getElementById('planMeta');
@@ -506,6 +563,23 @@ _VIEWER_HTML = """
             return v.toFixed ? v.toFixed(2) + ' m' : String(v) + ' m';
         }
 
+        function escHtml(text) {
+            return String(text)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/\"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function fmtObj(value) {
+            try {
+                return escHtml(JSON.stringify(value || {}, null, 2));
+            } catch (e) {
+                return escHtml(String(value));
+            }
+        }
+
         function updateStatusPanel(status) {
             overviewEl.textContent = status.overview || 'No overview available';
 
@@ -529,17 +603,39 @@ _VIEWER_HTML = """
                 return;
             }
             toolLogsEl.innerHTML = logs.slice().reverse().map(function(item) {
-                var args = item.args && Object.keys(item.args).length ? JSON.stringify(item.args) : '{}';
-                var argWhy = item.arg_reasons && Object.keys(item.arg_reasons).length
-                    ? JSON.stringify(item.arg_reasons)
-                    : '{}';
+                var args = fmtObj(item.args && Object.keys(item.args).length ? item.args : {});
+                var argWhy = fmtObj(item.arg_reasons && Object.keys(item.arg_reasons).length
+                    ? item.arg_reasons
+                    : {});
+                var reason = escHtml(item.reason || 'No reason provided');
+                var tool = escHtml(item.tool || 'unknown_tool');
+                var ts = escHtml(item.timestamp || '');
                 return '<li>' +
-                    '<div><span class="tool">' + item.tool + '</span> <span class="ts">' + (item.timestamp || '') + '</span></div>' +
-                    '<div class="reason">' + (item.reason || 'No reason provided') + '</div>' +
-                    '<div class="args">args: ' + args + '</div>' +
-                    '<div class="args">arg why: ' + argWhy + '</div>' +
+                    '<div><span class="tool">' + tool + '</span> <span class="ts">' + ts + '</span></div>' +
+                    '<div class="reason">' + reason + '</div>' +
+                    '<div class="args">args:<pre>' + args + '</pre></div>' +
+                    '<div class="args">arg why:<pre>' + argWhy + '</pre></div>' +
                     '</li>';
             }).join('');
+
+            var scans = status.recent_scans || [];
+            if (!scans.length) {
+                scanHistoryEl.innerHTML = '<li><span class="reason">No scan frames yet.</span></li>';
+            } else {
+                scanHistoryEl.innerHTML = scans.slice().reverse().map(function(scan) {
+                    var heading = (scan.heading_deg !== null && scan.heading_deg !== undefined)
+                        ? scan.heading_deg.toFixed(1) + '°'
+                        : '—';
+                    var when = escHtml(scan.timestamp || '');
+                    var desc = escHtml(scan.description || 'No description yet');
+                    var src = '/scan-frame?id=' + encodeURIComponent(scan.id) + '&_=' + Date.now();
+                    return '<li class="scan-entry">' +
+                        '<div class="scan-head"><span>Heading ' + heading + '</span><span>' + when + '</span></div>' +
+                        '<img src="' + src + '" alt="Scan frame" loading="lazy" />' +
+                        '<div class="scan-desc">' + desc + '</div>' +
+                        '</li>';
+                }).join('');
+            }
         }
 
         function drawArrow(ctx, x, y, angleRad, color) {
@@ -760,6 +856,8 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_mosaic_image()
         elif parsed_path == '/status':
             self._serve_status_json()
+        elif parsed_path == '/scan-frame':
+            self._serve_scan_frame()
         else:
             self.send_error(404)
 
@@ -827,6 +925,36 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_scan_frame(self):
+        bridge = self.bridge_ref
+        if bridge is None:
+            self.send_error(503, 'Bridge not ready')
+            return
+
+        qs = parse_qs(urlparse(self.path).query)
+        raw_id = (qs.get('id') or [None])[0]
+        if raw_id is None:
+            self.send_error(400, 'Missing scan frame id')
+            return
+
+        try:
+            scan_id = int(raw_id)
+        except (TypeError, ValueError):
+            self.send_error(400, 'Invalid scan frame id')
+            return
+
+        image_bytes = bridge.get_scan_frame_image(scan_id)
+        if image_bytes is None:
+            self.send_error(404, 'Scan frame not found')
+            return
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Length', str(len(image_bytes)))
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+        self.wfile.write(image_bytes)
 
     def _serve_mjpeg(self):
         self.send_response(200)
@@ -978,6 +1106,11 @@ class TurtleBot3Bridge:
         self._tool_trace_lock = threading.Lock()
         self._tool_trace: list[dict] = []
         self._tool_trace_max = 80
+
+        self._scan_history_lock = threading.Lock()
+        self._scan_history: list[dict] = []
+        self._scan_history_max = 120
+        self._scan_history_next_id = 1
 
         # QoS for sensor topics (best-effort — matches typical LiDAR/camera publishers)
         sensor_qos = QoSProfile(
@@ -1183,6 +1316,22 @@ class TurtleBot3Bridge:
         min_new_frames = max(1, int(min_new_frames))
         poll_interval = max(0.01, float(poll_interval))
 
+        frames_seen = 0
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(poll_interval)
+            with self._image_lock:
+                if self._image_stamp is not None and self._image_stamp != old_stamp:
+                    frames_seen += 1
+                    if frames_seen >= min_new_frames:
+                        return self._image_data, self._image_stamp
+                    # Update old_stamp to wait for the next distinct frame
+                    old_stamp = self._image_stamp
+
+        # Timeout — return whatever we have (better than nothing)
+        with self._image_lock:
+            return self._image_data, self._image_stamp
+
     def drive_until_lidar_stop(self, speed=0.18, stop_distance_m=0.5,
                                max_distance_m=2.5, timeout=None):
         """Drive forward continuously and stop once front lidar reaches threshold.
@@ -1282,22 +1431,6 @@ class TurtleBot3Bridge:
                 "message": f"Error during lidar-stop drive: {e}",
             }
 
-        frames_seen = 0
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            time.sleep(poll_interval)
-            with self._image_lock:
-                if self._image_stamp is not None and self._image_stamp != old_stamp:
-                    frames_seen += 1
-                    if frames_seen >= min_new_frames:
-                        return self._image_data, self._image_stamp
-                    # Update old_stamp to wait for the next distinct frame
-                    old_stamp = self._image_stamp
-
-        # Timeout — return whatever we have (better than nothing)
-        with self._image_lock:
-            return self._image_data, self._image_stamp
-
     # ------------------------------------------------------------------
     # Camera viewer (MJPEG stream)
     # ------------------------------------------------------------------
@@ -1371,11 +1504,81 @@ class TurtleBot3Bridge:
             self._mosaic_stamp = datetime.datetime.now().isoformat(timespec='seconds')
         _stderr(f"Mosaic updated ({len(jpeg_bytes)} bytes)")
 
+    def _record_scan_frame(self, jpeg_bytes: bytes, heading_deg: float, source: str = "scan"):
+        entry = {
+            "id": self._scan_history_next_id,
+            "timestamp": datetime.now().isoformat(timespec='seconds'),
+            "heading_deg": round(float(heading_deg), 1) if heading_deg is not None else None,
+            "source": source,
+            "description": None,
+            "image": jpeg_bytes,
+        }
+
+        with self._scan_history_lock:
+            self._scan_history_next_id += 1
+            self._scan_history.append(entry)
+            if len(self._scan_history) > self._scan_history_max:
+                self._scan_history = self._scan_history[-self._scan_history_max:]
+
+        return entry["id"]
+
+    def annotate_scan_frame(self, description: str, scan_id: int | None = None) -> dict:
+        description = (description or "").strip()
+        if not description:
+            return {"ok": False, "message": "description cannot be empty"}
+
+        with self._scan_history_lock:
+            if not self._scan_history:
+                return {"ok": False, "message": "no scan frames available to annotate"}
+
+            target = None
+            if scan_id is None:
+                target = self._scan_history[-1]
+            else:
+                for item in reversed(self._scan_history):
+                    if item["id"] == int(scan_id):
+                        target = item
+                        break
+
+            if target is None:
+                return {"ok": False, "message": f"scan_id {scan_id} not found"}
+
+            target["description"] = description
+            return {
+                "ok": True,
+                "scan_id": target["id"],
+                "timestamp": target["timestamp"],
+                "heading_deg": target["heading_deg"],
+                "description": target["description"],
+            }
+
+    def get_scan_frame_image(self, scan_id: int) -> bytes | None:
+        with self._scan_history_lock:
+            for item in self._scan_history:
+                if item["id"] == int(scan_id):
+                    return item["image"]
+        return None
+
+    def get_recent_scan_history(self, limit: int = 20):
+        with self._scan_history_lock:
+            items = list(self._scan_history[-max(1, int(limit)):])
+
+        result = []
+        for item in items:
+            result.append({
+                "id": item["id"],
+                "timestamp": item["timestamp"],
+                "heading_deg": item["heading_deg"],
+                "source": item.get("source"),
+                "description": item.get("description"),
+            })
+        return result
+
     # ------------------------------------------------------------------
     # Progressive search-frame accumulator
     # ------------------------------------------------------------------
 
-    def add_search_frame(self, jpeg_bytes: bytes, heading_deg: float):
+    def add_search_frame(self, jpeg_bytes: bytes, heading_deg: float, source: str = "scan"):
         """Append a camera frame captured during step-by-step search.
 
         Automatically rebuilds the mosaic for the web viewer so the
@@ -1383,6 +1586,8 @@ class TurtleBot3Bridge:
         """
         now = time.monotonic()
         should_rebuild = False
+
+        self._record_scan_frame(jpeg_bytes=jpeg_bytes, heading_deg=heading_deg, source=source)
 
         with self._search_frames_lock:
             # Deduplicate near-identical heading updates to avoid expensive
@@ -1668,6 +1873,7 @@ class TurtleBot3Bridge:
         perf = self.get_performance_snapshot()
         lidar = self.get_lidar_summary()
         recent_calls = self.get_recent_tool_calls(limit=10)
+        recent_scans = self.get_recent_scan_history(limit=20)
 
         overview = "Idle"
         if recent_calls:
@@ -1692,6 +1898,7 @@ class TurtleBot3Bridge:
             "pose": pose,
             "lidar": lidar,
             "recent_tools": recent_calls,
+            "recent_scans": recent_scans,
             "performance": perf,
         }
 

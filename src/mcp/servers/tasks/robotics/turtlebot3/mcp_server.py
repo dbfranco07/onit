@@ -1,7 +1,7 @@
 """
 TurtleBot3 MCP Server — sensor and motion tools for a TurtleBot3 robot via ROS 2.
 
-10 Core Tools:
+9 Core Tools:
   Sensors:
     1. get_camera_image    — Capture latest camera frame (returns ImageContent for VLMs)
     2. get_lidar_scan      — Latest 360° LiDAR scan (ranges, angles, limits)
@@ -10,11 +10,10 @@ TurtleBot3 MCP Server — sensor and motion tools for a TurtleBot3 robot via ROS
   Motion:
     5. move_forward        — Drive forward N metres (lidar-guarded, smooth ramping)
     6. turn                — Rotate N degrees (smooth ramping)
-    7. navigate_safely     — Move forward with automatic obstacle avoidance
-    8. stop                — Emergency stop
+        7. stop                — Emergency stop
   Utility:
-    9. open_camera_viewer  — Open live MJPEG camera stream in browser
-   10. diagnose_ros        — ROS 2 connectivity diagnostics
+        8. open_camera_viewer  — Open live MJPEG camera stream in browser
+        9. diagnose_ros        — ROS 2 connectivity diagnostics
 
 Designed for TurtleBot3 Burger on ROS 2 Humble.
 """
@@ -128,7 +127,7 @@ def _decision_context(bridge, tool_name: str, args: dict) -> str:
         lin_vel = (odom.get("linear_velocity") or {}).get("x")
         front_dist = bridge.check_obstacle(direction="front")
 
-        if tool_name in ("move_forward", "navigate_safely"):
+        if tool_name in ("move_forward",):
             if front_dist is None:
                 return "forward motion requested; lidar front distance unavailable"
             if front_dist < 0.3:
@@ -145,7 +144,7 @@ def _decision_context(bridge, tool_name: str, args: dict) -> str:
                 return "heading adjustment requested by navigation plan"
             return f"heading alignment for next step (current heading≈{heading:.1f}°)"
 
-        if tool_name in ("scan_step", "rotate_and_scan", "look_for_target", "get_camera_image"):
+        if tool_name in ("scan_step", "rotate_and_scan", "scan_360_mvp", "look_for_target", "get_camera_image"):
             if lin_vel is not None and abs(lin_vel) > 0.02:
                 return "visual update while robot is in motion"
             return "visual search/confirmation needed for target or scene understanding"
@@ -155,6 +154,9 @@ def _decision_context(bridge, tool_name: str, args: dict) -> str:
 
         if tool_name == "get_odometry":
             return "pose/heading verification after movement decision"
+
+        if tool_name == "describe_scan_image":
+            return "log visual interpretation for operator UI trace"
 
         return "selected by current task plan"
     except Exception:
@@ -172,7 +174,7 @@ def _argument_context(bridge, tool_name: str, args: dict) -> dict:
     except Exception:
         front_dist = None
 
-    if tool_name in ("move_forward", "navigate_safely"):
+    if tool_name in ("move_forward",):
         if "distance" in args:
             dist = args.get("distance")
             if front_dist is not None:
@@ -211,16 +213,24 @@ def _argument_context(bridge, tool_name: str, args: dict) -> dict:
         if "speed" in args:
             reasons["speed"] = "moderate angular speed to reduce overshoot"
 
-    elif tool_name in ("scan_step", "rotate_and_scan", "look_for_target"):
+    elif tool_name in ("scan_step", "rotate_and_scan", "scan_360_mvp", "look_for_target"):
         if "step_angle" in args:
             reasons["step_angle"] = "scan resolution tradeoff: smaller is more precise, larger is faster"
         if "total_angle" in args:
             reasons["total_angle"] = "scan coverage requested by current search objective"
+        if "frame_count" in args:
+            reasons["frame_count"] = "number of views sampled over a full 360° sweep"
         if "sweep_width_deg" in args:
             reasons["sweep_width_deg"] = "focused search arc around likely target heading"
 
     elif tool_name == "open_camera_viewer" and "port" in args:
         reasons["port"] = "viewer server port for operator monitoring"
+
+    elif tool_name == "describe_scan_image":
+        if "description" in args:
+            reasons["description"] = "human-readable visual finding for this scan frame"
+        if "scan_id" in args:
+            reasons["scan_id"] = "optional explicit scan frame reference; defaults to latest"
 
     return reasons
 
@@ -277,8 +287,10 @@ def get_camera_image() -> Image:
     # Feed frame into progressive mosaic for the web viewer
     try:
         odom = bridge.get_odom()
-        heading = odom["yaw_deg"] if odom else 0.0
-        bridge.add_search_frame(image_bytes, heading)
+        heading = 0.0
+        if odom:
+            heading = float(odom.get("orientation_yaw_deg", odom.get("yaw_deg", 0.0)))
+        bridge.add_search_frame(image_bytes, heading, source="get_camera_image")
     except Exception:
         pass  # non-critical — don't break the camera tool
 
@@ -555,49 +567,6 @@ def check_path_clear(
 
 
 @mcp.tool(
-    title="Navigate Safely",
-    description=(
-        "Move the TurtleBot3 forward with integrated lidar obstacle avoidance. "
-        "Unlike plain move_forward, this tool automatically checks the path "
-        "and attempts corrective turns if an obstacle is detected. Use this "
-        "when navigating through cluttered environments (desks, chairs, cables). "
-        "Default speed is 0.15 m/s (slightly slower for safety). "
-        "Returns details about the path taken, including any corrections."
-    ),
-)
-def navigate_safely(
-    distance: float = 0.5,
-    speed: float = 0.15,
-    obstacle_threshold_m: float = 0.3,
-) -> str:
-    """Navigate forward with automatic obstacle avoidance.
-
-    Args:
-        distance: Distance to travel in metres (positive). Default 0.5 m.
-        speed: Linear speed in m/s (0 < speed ≤ 0.22). Default 0.15 m/s.
-        obstacle_threshold_m: Stop/correct if obstacle closer than this. Default 0.3 m.
-    """
-    if distance <= 0:
-        return json.dumps({"error": "Distance must be positive.", "status": "failed"})
-    if speed <= 0:
-        return json.dumps({"error": "Speed must be positive.", "status": "failed"})
-
-    _trace_tool_call("navigate_safely", "Move with automatic obstacle avoidance.", {
-        "distance": distance,
-        "speed": speed,
-        "obstacle_threshold_m": obstacle_threshold_m,
-    })
-    bridge = _get_bridge()
-    result = bridge.navigate_safely(
-        distance_m=distance,
-        speed=speed,
-        obstacle_threshold_m=obstacle_threshold_m,
-    )
-    _mark_motion_if_success(result)
-    return json.dumps(result, indent=2, default=_json_default)
-
-
-@mcp.tool(
     title="Drive Until LiDAR Stop",
     description=(
         "Fast forward approach for low-clutter environments. "
@@ -652,8 +621,9 @@ def drive_until_lidar_stop(
     description=(
         "Open a live camera viewer in the operator's web browser. "
         "The viewer shows an MJPEG stream of the TurtleBot3 camera in real-time. "
-        "Use this before or during vision tasks so the operator can see what "
-        "the robot sees. Returns the URL of the viewer page."
+        "Use this for manual recovery if the viewer is not already running. "
+        "Do not call repeatedly during normal task execution. Returns the URL "
+        "of the viewer page."
     ),
 )
 def open_camera_viewer(
@@ -683,6 +653,34 @@ def open_camera_viewer(
             "status": "error",
             "message": f"Could not start viewer: {e}",
         }, indent=2)
+
+
+@mcp.tool(
+    title="Describe Scan Image",
+    description=(
+        "Attach a textual description to a captured scan frame so the "
+        "operator web UI shows the image and the assistant's interpretation "
+        "together. If scan_id is omitted, annotates the latest scan frame."
+    ),
+)
+def describe_scan_image(
+    description: str,
+    scan_id: int | None = None,
+) -> str:
+    """Store a visual description for a scan frame in the operator UI.
+
+    Args:
+        description: What is seen in the scan image.
+        scan_id: Optional frame id from scan history; defaults to latest frame.
+    """
+    _trace_tool_call("describe_scan_image", "Log per-frame scan description for operator UI.", {
+        "description": description,
+        "scan_id": scan_id,
+    })
+
+    bridge = _get_bridge()
+    result = bridge.annotate_scan_frame(description=description, scan_id=scan_id)
+    return json.dumps(result, indent=2, default=_json_default)
 
 
 # =========================================================================
@@ -1088,7 +1086,11 @@ def scan_step(
         return json.dumps(payload, default=_json_default)
 
     try:
-        bridge.add_search_frame(image_bytes, heading if heading is not None else 0.0)
+        bridge.add_search_frame(
+            image_bytes,
+            heading if heading is not None else 0.0,
+            source="scan_step",
+        )
     except Exception:
         pass
 
@@ -1220,6 +1222,14 @@ def rotate_and_scan(
 
         if image_bytes is not None:
             raw_frames.append(image_bytes)
+            try:
+                bridge.add_search_frame(
+                    image_bytes,
+                    round(odom_now["orientation_yaw_deg"], 1) if odom_now else round(i * step_abs * sign, 1),
+                    source="rotate_and_scan",
+                )
+            except Exception:
+                pass
         else:
             _stderr(f"  step {i+1}/{max_steps}: no frame captured")
 
@@ -1267,6 +1277,42 @@ def rotate_and_scan(
     )
 
     return [summary, pano_image]
+
+
+@mcp.tool(
+    title="Scan 360 MVP (fixed frame count)",
+    description=(
+        "MVP helper for full-area search: perform a 360° scan using a fixed "
+        "number of captures. Default is 20 images around the robot. "
+        "Returns the same output format as rotate_and_scan (summary + survey image)."
+    ),
+)
+def scan_360_mvp(
+    frame_count: int = 20,
+    settle_time: float = 0.1,
+    speed: float = 0.4,
+):
+    """Run a 360° survey with a fixed number of captures.
+
+    Args:
+        frame_count: Number of images to capture over 360°.
+        settle_time: Extra settle delay after each turn.
+        speed: Angular speed in rad/s.
+    """
+    if frame_count < 4 or frame_count > 72:
+        raise ValueError("frame_count must be between 4 and 72")
+
+    step_angle = 360.0 / float(frame_count)
+    _trace_tool_call("scan_360_mvp", "Full 360° scan using fixed number of samples.", {
+        "frame_count": frame_count,
+        "step_angle": step_angle,
+    })
+    return rotate_and_scan(
+        total_angle=360.0,
+        step_angle=step_angle,
+        settle_time=settle_time,
+        speed=speed,
+    )
 
 
 # =========================================================================
@@ -1349,6 +1395,14 @@ def look_for_target(
         raw_frames.append(image_bytes)
         odom_now = bridge.get_odom()
         headings.append(round(odom_now["orientation_yaw_deg"], 1) if odom_now else start_heading)
+        try:
+            bridge.add_search_frame(
+                image_bytes,
+                headings[-1],
+                source="look_for_target",
+            )
+        except Exception:
+            pass
 
     for i in range(max_steps):
         remaining_deg = total_abs - _math.degrees(sweep_accumulated_rad)
@@ -1386,6 +1440,14 @@ def look_for_target(
         )
         if image_bytes is not None:
             raw_frames.append(image_bytes)
+            try:
+                bridge.add_search_frame(
+                    image_bytes,
+                    round(odom_now["orientation_yaw_deg"], 1) if odom_now else round(start_heading + i * step_abs, 1),
+                    source="look_for_target",
+                )
+            except Exception:
+                pass
         else:
             _stderr(f"  look_for_target step {i+1}/{max_steps}: no frame captured")
 
@@ -1531,7 +1593,7 @@ def run(
     logger.info(f"Starting TurtleBot3 MCP Server at {host}:{port}{path}")
     logger.info(
         "11 Tools: get_camera_image, get_lidar_scan, get_odometry, check_path_clear, "
-        "move_forward, turn, navigate_safely, drive_until_lidar_stop, stop, open_camera_viewer, diagnose_ros, scan_step"
+        "move_forward, turn, drive_until_lidar_stop, stop, open_camera_viewer, describe_scan_image, diagnose_ros, scan_step"
     )
 
     if not verbose:

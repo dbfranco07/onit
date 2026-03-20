@@ -543,6 +543,21 @@ class TestMCPTools:
         # For mock environment, just verify the function runs.
         assert "status" in result
 
+    def test_describe_scan_image(self, bridge):
+        """describe_scan_image should forward annotations to the bridge."""
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        tb3_mcp._bridge = bridge
+
+        bridge.annotate_scan_frame = MagicMock(return_value={
+            "ok": True,
+            "scan_id": 1,
+            "description": "soccer ball near center",
+        })
+
+        result = json.loads(tb3_mcp.describe_scan_image(description="soccer ball near center"))
+        assert result["ok"] is True
+        bridge.annotate_scan_frame.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Camera viewer
@@ -1005,3 +1020,34 @@ class TestScanStep:
 
         assert payload["success"] is True
         assert payload["frame"] == "missing"
+
+
+class TestScan360MVP:
+    def test_scan_360_mvp_uses_frame_count(self, bridge):
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        tb3_mcp._bridge = bridge
+
+        called = {}
+
+        def _mock_rotate_and_scan(total_angle=360.0, step_angle=24.0, settle_time=0.2, speed=0.3):
+            called["total_angle"] = total_angle
+            called["step_angle"] = step_angle
+            called["settle_time"] = settle_time
+            called["speed"] = speed
+            return ["ok", MagicMock()]
+
+        with patch.object(tb3_mcp, "rotate_and_scan", side_effect=_mock_rotate_and_scan):
+            result = tb3_mcp.scan_360_mvp(frame_count=20, settle_time=0.1, speed=0.4)
+
+        assert isinstance(result, list)
+        assert called["total_angle"] == 360.0
+        assert abs(called["step_angle"] - 18.0) < 1e-9
+        assert called["settle_time"] == 0.1
+        assert called["speed"] == 0.4
+
+    def test_scan_360_mvp_frame_count_limits(self, bridge):
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        tb3_mcp._bridge = bridge
+
+        with pytest.raises(ValueError, match="frame_count must be between 4 and 72"):
+            tb3_mcp.scan_360_mvp(frame_count=3)
