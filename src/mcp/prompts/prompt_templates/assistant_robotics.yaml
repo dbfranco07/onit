@@ -291,7 +291,7 @@ instruction_template: |
   **Wall following** ("move along the wall until you reach the cabinet"):
   1. `get_camera_image` — identify the wall and your orientation relative to it.
   2. `get_lidar_scan` — measure your distance to the wall.
-  3. Position yourself parallel: aim to keep the wall 0.3–0.5 m to one side.
+  3. Position yourself parallel: aim to keep the wall 0.1-0.2 m to one side.
   4. REPEAT:
      a. `check_path_clear("front")` → `navigate_safely(distance=0.3)`.
      b. `get_lidar_scan` — check if you're drifting toward or away from the wall.

@@ -17,6 +17,8 @@ import math
 import os
 import sys
 import time
+import shutil
+import subprocess
 import threading
 import logging
 import webbrowser
@@ -31,6 +33,34 @@ logger = logging.getLogger(__name__)
 def _stderr(msg: str):
     """Print diagnostic to stderr so it isn't swallowed by multiprocessing."""
     print(f"[TurtleBot3Bridge] {msg}", file=sys.stderr, flush=True)
+
+
+def _open_url_in_browser(url: str) -> bool:
+    """Open URL with preferred Chromium launchers, fallback to system browser."""
+    candidates = [
+        ["flatpak", "run", "org.chromium.Chromium", url],
+        ["chromium-browser", url],
+        ["chromium", url],
+    ]
+
+    for command in candidates:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except Exception:
+            continue
+
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
 
 # TurtleBot3 Burger physical limits (ROBOTIS spec)
 MAX_LINEAR_SPEED = 0.22   # m/s
@@ -784,7 +814,8 @@ class TurtleBot3Bridge:
             url = f"http://localhost:{self._viewer_port}"
             _stderr(f"Camera viewer already running at {url}")
             if open_browser:
-                webbrowser.open(url)
+                if not _open_url_in_browser(url):
+                    _stderr(f"Could not auto-open browser — visit {url} manually")
             return url
 
         port = port or DEFAULT_VIEWER_PORT
@@ -811,7 +842,9 @@ class TurtleBot3Bridge:
 
         if open_browser:
             try:
-                webbrowser.open(url)
+                opened = _open_url_in_browser(url)
+                if not opened:
+                    raise RuntimeError("No browser launcher succeeded")
             except Exception:
                 _stderr(f"Could not auto-open browser — visit {url} manually")
 
