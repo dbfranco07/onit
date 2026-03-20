@@ -517,6 +517,7 @@ _VIEWER_HTML = """
 
     var toolLogsEl = document.getElementById('toolLogs');
     var scanHistoryEl = document.getElementById('scanHistory');
+    var lastScanRenderKey = '';
     var planCanvas = document.getElementById('planCanvas');
     var planCtx = planCanvas.getContext('2d');
     var planMetaEl = document.getElementById('planMeta');
@@ -600,41 +601,65 @@ _VIEWER_HTML = """
             var logs = status.recent_tools || [];
             if (!logs.length) {
                 toolLogsEl.innerHTML = '<li><span class="reason">No tool calls yet.</span></li>';
-                return;
+            } else {
+                toolLogsEl.innerHTML = logs.slice().reverse().map(function(item) {
+                    var args = fmtObj(item.args && Object.keys(item.args).length ? item.args : {});
+                    var argWhy = fmtObj(item.arg_reasons && Object.keys(item.arg_reasons).length
+                        ? item.arg_reasons
+                        : {});
+                    var reason = escHtml(item.reason || 'No reason provided');
+                    var tool = escHtml(item.tool || 'unknown_tool');
+                    var ts = escHtml(item.timestamp || '');
+                    return '<li>' +
+                        '<div><span class="tool">' + tool + '</span> <span class="ts">' + ts + '</span></div>' +
+                        '<div class="reason">' + reason + '</div>' +
+                        '<div class="args">args:<pre>' + args + '</pre></div>' +
+                        '<div class="args">arg why:<pre>' + argWhy + '</pre></div>' +
+                        '</li>';
+                }).join('');
             }
-            toolLogsEl.innerHTML = logs.slice().reverse().map(function(item) {
-                var args = fmtObj(item.args && Object.keys(item.args).length ? item.args : {});
-                var argWhy = fmtObj(item.arg_reasons && Object.keys(item.arg_reasons).length
-                    ? item.arg_reasons
-                    : {});
-                var reason = escHtml(item.reason || 'No reason provided');
-                var tool = escHtml(item.tool || 'unknown_tool');
-                var ts = escHtml(item.timestamp || '');
-                return '<li>' +
-                    '<div><span class="tool">' + tool + '</span> <span class="ts">' + ts + '</span></div>' +
-                    '<div class="reason">' + reason + '</div>' +
-                    '<div class="args">args:<pre>' + args + '</pre></div>' +
-                    '<div class="args">arg why:<pre>' + argWhy + '</pre></div>' +
-                    '</li>';
-            }).join('');
 
             var scans = status.recent_scans || [];
             if (!scans.length) {
-                scanHistoryEl.innerHTML = '<li><span class="reason">No scan frames yet.</span></li>';
+                if (lastScanRenderKey !== '__empty__') {
+                    scanHistoryEl.innerHTML = '<li><span class="reason">No scan frames yet.</span></li>';
+                    lastScanRenderKey = '__empty__';
+                }
             } else {
+                var scanRenderKey = JSON.stringify(scans.map(function(scan) {
+                    return [scan.id, scan.timestamp || '', scan.description || ''];
+                }));
+
+                if (scanRenderKey === lastScanRenderKey) {
+                    return;
+                }
+
+                var previousScrollTop = scanHistoryEl.scrollTop;
+                var previousScrollHeight = scanHistoryEl.scrollHeight;
+                var pinnedToLatest = previousScrollTop <= 8;
+
                 scanHistoryEl.innerHTML = scans.slice().reverse().map(function(scan) {
                     var heading = (scan.heading_deg !== null && scan.heading_deg !== undefined)
                         ? scan.heading_deg.toFixed(1) + '°'
                         : '—';
                     var when = escHtml(scan.timestamp || '');
                     var desc = escHtml(scan.description || 'No description yet');
-                    var src = '/scan-frame?id=' + encodeURIComponent(scan.id) + '&_=' + Date.now();
+                    var src = '/scan-frame?id=' + encodeURIComponent(scan.id);
                     return '<li class="scan-entry">' +
                         '<div class="scan-head"><span>Heading ' + heading + '</span><span>' + when + '</span></div>' +
                         '<img src="' + src + '" alt="Scan frame" loading="lazy" />' +
                         '<div class="scan-desc">' + desc + '</div>' +
                         '</li>';
                 }).join('');
+
+                if (pinnedToLatest) {
+                    scanHistoryEl.scrollTop = 0;
+                } else {
+                    var heightDelta = scanHistoryEl.scrollHeight - previousScrollHeight;
+                    scanHistoryEl.scrollTop = previousScrollTop + Math.max(0, heightDelta);
+                }
+
+                lastScanRenderKey = scanRenderKey;
             }
         }
 
