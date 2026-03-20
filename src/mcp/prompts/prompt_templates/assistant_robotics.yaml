@@ -375,5 +375,5 @@ instruction_template: |
 
 metadata:
    version: "7.2"
-  description: "TurtleBot3 robotics assistant — contact-sheet survey with turn_to_heading and look_for_target for reliable object re-acquisition"
-  use_case: "Robot teleoperation via natural language"
+   description: "TurtleBot3 robotics assistant — contact-sheet survey with turn_to_heading and look_for_target for reliable object re-acquisition"
+   use_case: "Robot teleoperation via natural language"
