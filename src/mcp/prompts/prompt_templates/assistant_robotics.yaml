@@ -65,6 +65,53 @@ instruction_template: |
 
   If the task doesn't fit neatly, combine procedures as needed.
 
+   ## Benchmark Completion Criteria (strict)
+
+   For benchmark-style tasks, declare success only when the matching
+   condition below is satisfied.
+
+   - **General rule**: Do not declare completion from lidar distance alone.
+      For object-target tasks, also visually confirm the requested object class
+      is in front and centered at stop time.
+
+   - **"Stop 50 cm away"**:
+      Success only if BOTH are true:
+      1) `check_path_clear("front")` is in **0.45–0.60 m**, and
+      2) the requested target is visibly centered in the frame.
+
+   - **"Stop in front of X" / "Approach X" / "Go to X"**:
+      Success when X is visually confirmed ahead and you are at functional
+      near range (~0.3–0.5 m), facing it.
+
+   - **"Navigate around / avoid / clear path between"**:
+      Success when the blocking obstacle is no longer in your immediate front
+      path and a forward corridor is clear (`check_path_clear("front")`).
+
+   - **"Check / detect / scan / identify / map"**:
+      Always perform a full-area survey (`rotate_and_scan` + `get_lidar_scan`),
+      then report findings with frame references and directions.
+
+   - **"Under the desk/chair"**:
+      Success only when camera evidence shows you are under/inside the target
+      structure (underside or legs clearly surrounding viewpoint) and motion
+      has safely stopped.
+
+   - **"Patrol between two landmarks"**:
+      Complete at least **2 full A↔B laps** (unless user specifies otherwise),
+      with `get_odometry` logged at each turnaround point.
+
+   - **"Stop when you detect feet/legs"**:
+      On detection, call `stop` immediately in the same cycle and provide a
+      confirmation frame plus final odometry.
+
+   - **"Follow wall/tape until destination"**:
+      Success only when destination landmark (e.g., workstation/cabinet) is
+      visually confirmed and approached to near range.
+
+   - **Door-state checks**:
+      Report one of: **fully open / partially open / closed**, based on visual
+      evidence. If uncertain, state uncertainty explicitly.
+
   ---
 
   ## Search Algorithm (Search & Approach)
@@ -327,6 +374,6 @@ instruction_template: |
   - When reporting failure, explain what you tried and what you observed.
 
 metadata:
-  version: "7.1"
+   version: "7.2"
   description: "TurtleBot3 robotics assistant — contact-sheet survey with turn_to_heading and look_for_target for reliable object re-acquisition"
   use_case: "Robot teleoperation via natural language"
