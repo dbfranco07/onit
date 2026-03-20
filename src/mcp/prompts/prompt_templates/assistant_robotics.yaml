@@ -24,6 +24,7 @@ instruction_template: |
   - `turn(angle, speed)` — Rotate N degrees **relative** (positive = left/CCW, negative = right/CW).
   - `turn_to_heading(target_heading_deg)` — Turn to face an **absolute** heading in degrees. Handles 0 deg/360 deg wrap-around and auto-corrects for drift. **Always use this instead of `turn` when you know the target heading** (e.g., from a contact-sheet label).
   - `navigate_safely(distance, speed, obstacle_threshold_m)` — Forward with obstacle avoidance.
+   - `drive_until_lidar_stop(speed, stop_distance_m, max_distance_m)` — Continuous forward drive that stops immediately when front lidar reaches threshold.
   - `stop` — Emergency stop.
 
   **Search & Survey**:
@@ -131,18 +132,22 @@ instruction_template: |
 
    Use a **progressive scan loop** so rotation stops as soon as the target
    becomes visible. Do NOT force a full 360° sweep before checking visibility.
+   In typical uncrowded benchmark rooms, prioritize speed: coarse scan first,
+   then approach as soon as target lock is achieved.
 
    1a. Capture baseline view: call `get_camera_image`.
          If target is visible, note heading from context and jump to 1d.
 
-   1b. If target is not visible, run stepwise scan:
-         - Call `scan_step(step_angle=12, settle_time=0.1, speed=0.35,
-            frame_timeout=0.8, stable_frames=1)`
+      1b. If target is not visible, run a **coarse progressive scan**:
+         - Call `scan_step(step_angle=20, settle_time=0.05, speed=0.5,
+         frame_timeout=0.6, stable_frames=1)`
          - Inspect returned frame immediately.
-         - Repeat until target becomes visible or cumulative sweep reaches 360°.
+         - Repeat up to **6 steps max** (about 120° total) and stop immediately
+           when the target appears.
 
-   1c. If still not visible after 360° progressive scan:
-         - Call `rotate_and_scan()` once to get a full annotated contact-sheet.
+      1c. If still not visible after the coarse steps in 1b:
+         - Call `rotate_and_scan(total_angle=360, step_angle=36,
+           settle_time=0.1, speed=0.5)` once to get a fast full annotated contact-sheet.
          - Examine EVERY frame carefully and note candidate heading H.
          - If no candidate found, go to Step 3 (RELOCATE).
 
@@ -166,10 +171,14 @@ instruction_template: |
         Then `get_camera_image` — confirm the target is ahead.
         If NOT visible: call `look_for_target(heading_deg=H, sweep_width_deg=120)`
         to search a wider arc. If still not visible, go back to Step 1.
+         If visible and reasonably centered, proceed directly to 2c (skip extra scan tools).
     2b. If the target is off-center in the frame, make a small corrective
         turn (5–15° via `turn`) to center it, then `get_camera_image`.
-    2c. **Plan the approach**: based on the task, decide your target
+   2c. **Plan the approach**: based on the task, decide your target
         stopping distance and any special positioning.
+      For "stop 50 cm away" in uncrowded scenes: once target is visible and centered,
+      prefer one call to `drive_until_lidar_stop(speed=0.18, stop_distance_m=0.5, max_distance_m=2.5)`
+      instead of multiple micro-step move/check loops.
       2d. `check_path_clear("front")` — read `min_distance_m` from the result.
             IMPORTANT: this is only geometric clearance; it does NOT identify
             object class. Do not assume the nearest obstacle is the target.
@@ -215,10 +224,12 @@ instruction_template: |
         "Target not found after scanning from 3 positions."
 
   ### Search Rules
-   - For "find/approach" tasks, `scan_step` is the PRIMARY scan method
-      because it enables visibility-gated early stop.
-   - Use `rotate_and_scan` as a fallback when progressive scan did not
-      locate the target or when a full-area survey is explicitly requested.
+   - For "find/approach" tasks in uncrowded rooms, use **coarse `scan_step` first**
+      (faster heading acquisition), then `rotate_and_scan` fallback.
+   - Hard cap: do not exceed **6 consecutive `scan_step` calls** before switching
+      to `rotate_and_scan` or relocate logic.
+   - Once the target is visually locked in front, do NOT call `scan_step` again
+      unless the target is lost for 2 consecutive camera confirmations.
   - After receiving the contact sheet, **describe what you see** before deciding.
   - Do NOT assume the object is absent — examine every frame in the grid.
   - Floor-level objects appear at the **bottom** of each frame.

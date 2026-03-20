@@ -1183,6 +1183,105 @@ class TurtleBot3Bridge:
         min_new_frames = max(1, int(min_new_frames))
         poll_interval = max(0.01, float(poll_interval))
 
+    def drive_until_lidar_stop(self, speed=0.18, stop_distance_m=0.5,
+                               max_distance_m=2.5, timeout=None):
+        """Drive forward continuously and stop once front lidar reaches threshold.
+
+        This is a fast-path approach primitive for low-clutter environments:
+        no pre-check loops, no side correction strategy. It simply drives
+        forward and issues an immediate stop when front distance is within
+        ``stop_distance_m``.
+
+        Args:
+            speed: Forward speed in m/s.
+            stop_distance_m: Stop trigger on front lidar distance (m).
+            max_distance_m: Hard travel cap if trigger never occurs.
+            timeout: Optional command timeout in seconds.
+
+        Returns:
+            dict with status, travelled distance and stop reason.
+        """
+        if timeout is None:
+            timeout = DEFAULT_MOTION_TIMEOUT
+
+        speed = min(abs(speed), MAX_LINEAR_SPEED)
+        stop_distance_m = max(0.05, float(stop_distance_m))
+        max_distance_m = max(0.05, float(max_distance_m))
+
+        if not self._wait_for_odom():
+            self.stop()
+            return {
+                "success": False,
+                "message": "No odometry data available — is the robot running?",
+            }
+
+        start_odom = self.get_odom()
+        sx, sy = start_odom["position"]["x"], start_odom["position"]["y"]
+        start_time = time.monotonic()
+        rate_sleep = 1.0 / CONTROL_HZ
+
+        try:
+            while True:
+                elapsed = time.monotonic() - start_time
+                if elapsed > timeout:
+                    self.stop()
+                    cur = self.get_odom()
+                    cx, cy = cur["position"]["x"], cur["position"]["y"]
+                    dist_actual = math.hypot(cx - sx, cy - sy)
+                    return {
+                        "success": False,
+                        "stop_reason": "timeout",
+                        "distance_actual_m": round(dist_actual, 4),
+                        "distance_cap_m": max_distance_m,
+                        "message": f"Timed out after {timeout}s",
+                    }
+
+                front_dist = self.check_obstacle(direction="front")
+                if front_dist is not None and front_dist <= stop_distance_m:
+                    self.stop()
+                    cur = self.get_odom()
+                    cx, cy = cur["position"]["x"], cur["position"]["y"]
+                    dist_actual = math.hypot(cx - sx, cy - sy)
+                    return {
+                        "success": True,
+                        "stop_reason": "lidar_threshold",
+                        "stop_distance_target_m": round(stop_distance_m, 3),
+                        "front_distance_m": round(front_dist, 3),
+                        "distance_actual_m": round(dist_actual, 4),
+                        "start_position": {"x": round(sx, 4), "y": round(sy, 4)},
+                        "end_position": {"x": round(cx, 4), "y": round(cy, 4)},
+                        "message": (
+                            f"Stopped on lidar trigger at {front_dist:.2f}m "
+                            f"(target {stop_distance_m:.2f}m)."
+                        ),
+                    }
+
+                cur = self.get_odom()
+                cx, cy = cur["position"]["x"], cur["position"]["y"]
+                dist_actual = math.hypot(cx - sx, cy - sy)
+                if dist_actual >= max_distance_m:
+                    self.stop()
+                    return {
+                        "success": False,
+                        "stop_reason": "distance_cap",
+                        "distance_actual_m": round(dist_actual, 4),
+                        "distance_cap_m": max_distance_m,
+                        "message": (
+                            f"Reached max_distance_m ({max_distance_m:.2f}m) "
+                            "before lidar stop trigger."
+                        ),
+                    }
+
+                self._publish_twist(linear_x=speed)
+                time.sleep(rate_sleep)
+        except Exception as e:
+            self.stop()
+            return {
+                "success": False,
+                "stop_reason": "error",
+                "message": f"Error during lidar-stop drive: {e}",
+            }
+
         frames_seen = 0
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

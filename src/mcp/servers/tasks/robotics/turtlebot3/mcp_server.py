@@ -189,6 +189,14 @@ def _argument_context(bridge, tool_name: str, args: dict) -> dict:
         if "obstacle_threshold_m" in args:
             reasons["obstacle_threshold_m"] = "safety margin for triggering obstacle avoidance"
 
+    elif tool_name == "drive_until_lidar_stop":
+        if "speed" in args:
+            reasons["speed"] = "faster continuous approach speed for low-clutter scenes"
+        if "stop_distance_m" in args:
+            reasons["stop_distance_m"] = "front lidar threshold for immediate stop trigger"
+        if "max_distance_m" in args:
+            reasons["max_distance_m"] = "hard cap to prevent indefinite forward motion"
+
     elif tool_name == "check_path_clear":
         if "direction" in args:
             reasons["direction"] = "requested movement/planning direction to validate"
@@ -584,6 +592,52 @@ def navigate_safely(
         distance_m=distance,
         speed=speed,
         obstacle_threshold_m=obstacle_threshold_m,
+    )
+    _mark_motion_if_success(result)
+    return json.dumps(result, indent=2, default=_json_default)
+
+
+@mcp.tool(
+    title="Drive Until LiDAR Stop",
+    description=(
+        "Fast forward approach for low-clutter environments. "
+        "Drives continuously and stops immediately when front LiDAR distance "
+        "reaches the configured threshold. "
+        "This skips pre-check/correction loops and is intended for tasks like "
+        "'move toward the soccer ball and stop 50 cm away' once the target "
+        "is visually locked in front."
+    ),
+)
+def drive_until_lidar_stop(
+    speed: float = 0.18,
+    stop_distance_m: float = 0.5,
+    max_distance_m: float = 2.5,
+) -> str:
+    """Drive forward continuously until front lidar threshold is reached.
+
+    Args:
+        speed: Forward speed in m/s.
+        stop_distance_m: Front lidar stop threshold in metres.
+        max_distance_m: Maximum distance cap to travel before stopping.
+    """
+    if speed <= 0:
+        return json.dumps({"error": "Speed must be positive.", "status": "failed"})
+    if stop_distance_m <= 0:
+        return json.dumps({"error": "stop_distance_m must be positive.", "status": "failed"})
+    if max_distance_m <= 0:
+        return json.dumps({"error": "max_distance_m must be positive.", "status": "failed"})
+
+    _trace_tool_call("drive_until_lidar_stop", "Fast continuous approach with lidar-triggered stop.", {
+        "speed": speed,
+        "stop_distance_m": stop_distance_m,
+        "max_distance_m": max_distance_m,
+    })
+
+    bridge = _get_bridge()
+    result = bridge.drive_until_lidar_stop(
+        speed=speed,
+        stop_distance_m=stop_distance_m,
+        max_distance_m=max_distance_m,
     )
     _mark_motion_if_success(result)
     return json.dumps(result, indent=2, default=_json_default)
@@ -1477,7 +1531,7 @@ def run(
     logger.info(f"Starting TurtleBot3 MCP Server at {host}:{port}{path}")
     logger.info(
         "11 Tools: get_camera_image, get_lidar_scan, get_odometry, check_path_clear, "
-        "move_forward, turn, navigate_safely, stop, open_camera_viewer, diagnose_ros, scan_step"
+        "move_forward, turn, navigate_safely, drive_until_lidar_stop, stop, open_camera_viewer, diagnose_ros, scan_step"
     )
 
     if not verbose:
