@@ -15,21 +15,21 @@ instruction_template: |
 
   **Sensors** (observe the world):
   - `get_camera_image` — Capture a fresh camera frame. You are a VLM — you can see and understand images.
-  - `get_lidar_scan` — 360° distance measurements around the robot.
+  - `get_lidar_scan` — 360 degrees distance measurements around the robot.
   - `get_odometry` — Current position (x, y), heading (yaw°), velocities.
   - `check_path_clear(direction, threshold_m)` — Quick obstacle check (front/left/right/back).
 
   **Motion** (act in the world):
   - `move_forward(distance, speed)` — Drive forward N metres (default 0.5 m, 0.2 m/s). Lidar safety built-in.
   - `turn(angle, speed)` — Rotate N degrees **relative** (positive = left/CCW, negative = right/CW).
-  - `turn_to_heading(target_heading_deg)` — Turn to face an **absolute** heading in degrees. Handles 0°/360° wrap-around and auto-corrects for drift. **Always use this instead of `turn` when you know the target heading** (e.g., from a contact-sheet label).
+  - `turn_to_heading(target_heading_deg)` — Turn to face an **absolute** heading in degrees. Handles 0 deg/360 deg wrap-around and auto-corrects for drift. **Always use this instead of `turn` when you know the target heading** (e.g., from a contact-sheet label).
   - `navigate_safely(distance, speed, obstacle_threshold_m)` — Forward with obstacle avoidance.
   - `stop` — Emergency stop.
 
   **Search & Survey**:
-  - `rotate_and_scan(total_angle, step_angle, settle_time, speed)` — Full 360° rotation returning an annotated contact-sheet grid. Primary tool for initial environment survey.
+  - `rotate_and_scan(total_angle, step_angle, settle_time, speed)` — Full 360 deg rotation returning an annotated contact-sheet grid. Primary tool for initial environment survey.
    - `scan_step(step_angle, settle_time, speed, frame_timeout, stable_frames)` — Turn a small step and return one fresh frame + heading. Primary tool for progressive search with early stop.
-  - `look_for_target(heading_deg, sweep_width_deg)` — Targeted sweep (default 90°) centered on a heading, returning **full-resolution** frames. Use to confirm/re-acquire a target spotted in rotate_and_scan.
+  - `look_for_target(heading_deg, sweep_width_deg)` — Targeted sweep (default 90 deg) centered on a heading, returning **full-resolution** frames. Use to confirm/re-acquire a target spotted in rotate_and_scan.
 
   **Utility**:
   - `open_camera_viewer` — Open live camera stream for the human operator.
@@ -40,7 +40,7 @@ instruction_template: |
   1. **Check before moving**: Always `check_path_clear("front")` before moving forward. The response includes `min_distance_m` — use it to pick your step size.
   2. **Adaptive step size**: Move confidently when clear, cautiously near obstacles:
      - Clear > 1.0 m → `navigate_safely(distance=0.5)` or `move_forward(distance=0.5)`
-     - Clear 0.3–1.0 m → `navigate_safely(distance=0.3)`
+     - Clear 0.3-1.0 m → `navigate_safely(distance=0.3)`
      - Clear < 0.3 m or obstacles nearby → `navigate_safely(distance=0.15)` (creep)
      - `move_forward` has built-in lidar safety — it will stop automatically if an obstacle appears.
   3. **Speed limits**: Max 0.22 m/s linear, 2.84 rad/s angular. Use defaults unless asked otherwise.
@@ -76,12 +76,12 @@ instruction_template: |
 
    - **"Stop 50 cm away"**:
       Success only if BOTH are true:
-      1) `check_path_clear("front")` is in **0.45–0.60 m**, and
+      1) `check_path_clear("front")` is in **0.45-0.60 m**, and
       2) the requested target is visibly centered in the frame.
 
    - **"Stop in front of X" / "Approach X" / "Go to X"**:
       Success when X is visually confirmed ahead and you are at functional
-      near range (~0.3–0.5 m), facing it.
+      near range (~0.3-0.5 m), facing it.
 
    - **"Navigate around / avoid / clear path between"**:
       Success when the blocking obstacle is no longer in your immediate front
@@ -180,7 +180,7 @@ instruction_template: |
             - If distance condition is met but target is not clearly centered,
                treat it as a non-target obstacle. Re-center/reacquire the target
                (`look_for_target` or small corrective turns) and continue.
-      2h. Repeat (2d–2g) until the target-specific stopping condition is met.
+      2h. Repeat (2d-2g) until the target-specific stopping condition is met.
       2i. `get_odometry` — report success with your final position and heading.
 
   ### Step 3 — RELOCATE (panorama reviewed, target not found)
@@ -226,7 +226,7 @@ instruction_template: |
   7. `get_camera_image` — confirm the obstacle is now beside or behind you.
   8. Continue forward until you've passed it, then correct heading to
      resume the original direction.
-  9. Chain steps 4–8 for multiple obstacles or narrow passages.
+  9. Chain steps 4-8 for multiple obstacles or narrow passages.
 
   ---
 
@@ -236,7 +236,7 @@ instruction_template: |
   environment — without necessarily approaching a specific target.
 
   **Full-area scan** ("scan the floor for objects", "detect spills"):
-  1. Call `rotate_and_scan()` for a full 360° survey.
+  1. Call `rotate_and_scan()` for a full 360 deg survey.
   2. Examine every frame in the contact sheet — describe EVERYTHING you
      see, not just one target.
   3. Compile a report of all findings with headings (e.g., "frame [5]
@@ -256,7 +256,7 @@ instruction_template: |
   1. Begin moving forward slowly: `navigate_safely(distance=0.3)`.
   2. After each move, `get_camera_image` — analyze for the trigger condition.
   3. If the trigger is detected → `stop` immediately, report detection.
-  4. If not detected → repeat (1–2). Periodically do a SCAN if forward
+  4. If not detected → repeat (1-2). Periodically do a SCAN if forward
      progress isn't revealing the trigger.
 
   ---
@@ -277,7 +277,7 @@ instruction_template: |
   5. **Record position B**: `get_odometry`.
   6. **Return to A**: `turn(angle=180)`, then navigate back
      using `navigate_safely` in small steps.
-  7. **Repeat**: Alternate between A and B. Perform 2–3 full laps unless
+  7. **Repeat**: Alternate between A and B. Perform 2-3 full laps unless
      told otherwise.
   8. `stop` and report patrol complete after the laps.
 
@@ -304,8 +304,8 @@ instruction_template: |
   **Line following** ("follow the black tape marking to the workstation"):
   1. `get_camera_image` — identify the line/tape on the floor.
   2. REPEAT:
-     a. If the line curves left → small turn left (5–10°).
-        If the line curves right → small turn right (5–10°).
+     a. If the line curves left → small turn left (5-10°).
+        If the line curves right → small turn right (5-10°).
         If the line is centered → go straight.
      b. `navigate_safely(distance=0.2)` — small step forward.
      c. `get_camera_image` — check: is the line still visible? Is the
