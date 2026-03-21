@@ -344,8 +344,17 @@ def get_lidar_scan(
         "right": _range_stats(ranges, 0, n, 225, 315),
     }
 
+    frontal_profile = {
+        "front_center": _range_stats(ranges, 0, n, -12, 12),
+        "front_left": _range_stats(ranges, 0, n, 12, 45),
+        "front_right": _range_stats(ranges, 0, n, -45, -12),
+    }
+    side_wall_risk = _detect_side_wall_stop_risk(ranges, n)
+
     return json.dumps({
         "quadrants": quadrants,
+        "frontal_profile": frontal_profile,
+        "side_wall_risk": side_wall_risk,
         "total_points": n,
         "range_min_m": scan["range_min"],
         "range_max_m": scan["range_max"],
@@ -559,6 +568,19 @@ def check_path_clear(
 
     bridge = _get_bridge()
     result = bridge.check_path_clear(direction=direction, threshold_m=threshold_m)
+
+    if direction == "front" and isinstance(result, dict):
+        scan = bridge.get_lidar()
+        if scan and isinstance(scan, dict):
+            ranges = scan.get("ranges") or []
+            if ranges:
+                risk = _detect_side_wall_stop_risk(ranges, len(ranges))
+                result["side_wall_risk"] = risk
+                if risk.get("likely"):
+                    result["warning"] = (
+                        "Frontal minimum may be side-wall dominated. "
+                        "Re-center target and verify with heading micro-check before declaring target reached."
+                    )
 
     if direction == "front" and isinstance(result, dict):
         _record_front_check_result(threshold_m=threshold_m, result=result)
@@ -1525,6 +1547,74 @@ def _range_stats(ranges, start_idx, total, angle_start_deg, angle_end_deg):
         "max_m": round(max(valid), 3),
         "avg_m": round(sum(valid) / len(valid), 3),
         "points": len(valid),
+    }
+
+
+def _detect_side_wall_stop_risk(ranges, total):
+    front_center = _range_stats(ranges, 0, total, -12, 12)
+    front_left = _range_stats(ranges, 0, total, 12, 45)
+    front_right = _range_stats(ranges, 0, total, -45, -12)
+
+    center_min = front_center.get("min_m")
+    left_min = front_left.get("min_m")
+    right_min = front_right.get("min_m")
+
+    flank_candidates = []
+    if left_min is not None:
+        flank_candidates.append(("left", left_min))
+    if right_min is not None:
+        flank_candidates.append(("right", right_min))
+
+    if not flank_candidates:
+        return {
+            "likely": False,
+            "dominant_side": None,
+            "reason": "insufficient flank lidar data",
+        }
+
+    dominant_side, dominant_min = min(flank_candidates, key=lambda item: item[1])
+    opposite_min = right_min if dominant_side == "left" else left_min
+
+    if dominant_min is None:
+        return {
+            "likely": False,
+            "dominant_side": None,
+            "reason": "no dominant flank return",
+        }
+
+    near_threshold = 0.45
+    center_gap_threshold = 0.08
+    opposite_gap_threshold = 0.10
+
+    center_far_or_missing = (
+        center_min is None or
+        (center_min - dominant_min) >= center_gap_threshold
+    )
+    opposite_far_or_missing = (
+        opposite_min is None or
+        (opposite_min - dominant_min) >= opposite_gap_threshold
+    )
+
+    likely = (
+        dominant_min <= near_threshold and
+        center_far_or_missing and
+        opposite_far_or_missing
+    )
+
+    if likely:
+        reason = (
+            f"{dominant_side} front flank return ({dominant_min:.2f}m) is much nearer than front-center"
+        )
+    else:
+        reason = "front returns are center-consistent"
+
+    return {
+        "likely": bool(likely),
+        "dominant_side": dominant_side,
+        "dominant_flank_min_m": dominant_min,
+        "front_center_min_m": center_min,
+        "opposite_flank_min_m": opposite_min,
+        "reason": reason,
     }
 
 

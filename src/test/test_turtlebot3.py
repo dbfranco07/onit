@@ -489,6 +489,85 @@ class TestMCPTools:
         result = json.loads(tb3_mcp.get_lidar_scan())
         assert "error" in result
 
+    def test_get_lidar_scan_flags_likely_side_wall_stop(self, bridge):
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        tb3_mcp._bridge = bridge
+
+        ranges = [float("inf")] * 360
+        ranges[330] = 0.23
+        ranges[0] = 0.66
+        ranges[30] = 0.78
+
+        msg = MagicMock()
+        msg.ranges = ranges
+        msg.angle_min = 0.0
+        msg.angle_max = 2 * math.pi
+        msg.angle_increment = math.pi / 180.0
+        msg.range_min = 0.12
+        msg.range_max = 3.5
+        stamp = MagicMock()
+        stamp.sec = 1000
+        stamp.nanosec = 0
+        msg.header.stamp = stamp
+        bridge._lidar_cb(msg)
+
+        result = json.loads(tb3_mcp.get_lidar_scan(summarize=True))
+        assert "side_wall_risk" in result
+        assert result["side_wall_risk"]["likely"] is True
+        assert result["side_wall_risk"]["dominant_side"] == "right"
+
+    def test_get_lidar_scan_no_side_wall_flag_when_center_is_nearest(self, bridge):
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        tb3_mcp._bridge = bridge
+
+        ranges = [float("inf")] * 360
+        ranges[330] = 0.52
+        ranges[0] = 0.28
+        ranges[30] = 0.49
+
+        msg = MagicMock()
+        msg.ranges = ranges
+        msg.angle_min = 0.0
+        msg.angle_max = 2 * math.pi
+        msg.angle_increment = math.pi / 180.0
+        msg.range_min = 0.12
+        msg.range_max = 3.5
+        stamp = MagicMock()
+        stamp.sec = 1000
+        stamp.nanosec = 0
+        msg.header.stamp = stamp
+        bridge._lidar_cb(msg)
+
+        result = json.loads(tb3_mcp.get_lidar_scan(summarize=True))
+        assert "side_wall_risk" in result
+        assert result["side_wall_risk"]["likely"] is False
+
+    def test_check_path_clear_front_includes_side_wall_warning(self, bridge):
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        tb3_mcp._bridge = bridge
+
+        ranges = [float("inf")] * 360
+        ranges[332] = 0.24
+        ranges[0] = 0.70
+        ranges[28] = 0.82
+
+        msg = MagicMock()
+        msg.ranges = ranges
+        msg.angle_min = 0.0
+        msg.angle_max = 2 * math.pi
+        msg.angle_increment = math.pi / 180.0
+        msg.range_min = 0.12
+        msg.range_max = 3.5
+        stamp = MagicMock()
+        stamp.sec = 1000
+        stamp.nanosec = 0
+        msg.header.stamp = stamp
+        bridge._lidar_cb(msg)
+
+        result = json.loads(tb3_mcp.check_path_clear(direction="front", threshold_m=0.3))
+        assert result["side_wall_risk"]["likely"] is True
+        assert "warning" in result
+
     def test_get_odometry_no_data(self, bridge):
         import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
         tb3_mcp._bridge = bridge
