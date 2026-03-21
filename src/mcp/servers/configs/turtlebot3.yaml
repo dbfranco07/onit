@@ -1,0 +1,30 @@
+# TurtleBot3 MCP Server Runner Configuration
+# Start with: onit --mcp --config src/mcp/servers/configs/turtlebot3.yaml
+# Or auto-started via: onit --a2a --config src/configs/turtlebot3.yaml
+
+servers:
+  - name: PromptsMCPServer
+    module: src.mcp.prompts.prompts
+    description: "MCP server for prompt templates and instruction generation"
+    enabled: true
+    host: 0.0.0.0
+    port: 18200
+    path: /sse
+    transport: 'sse'
+
+  - name: TurtleBot3MCPServer
+    module: tasks.robotics.turtlebot3
+    description: "Sensor and motion tools for TurtleBot3 via ROS 2"
+    enabled: true
+    host: 0.0.0.0
+    port: 18202
+    path: /sse
+    transport: 'sse'
+    options:
+      ros_domain_id: 67
+      camera_topic: /camera/image/compressed
+      lidar_topic: /scan
+      odom_topic: /odom
+      cmd_vel_topic: /cmd_vel
+      camera_viewer_port: 18280
+      camera_viewer_autostart: true

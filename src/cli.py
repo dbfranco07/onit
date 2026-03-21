@@ -238,11 +238,17 @@ def _mcp_servers_ready(config_data: dict, timeout: float = 15.0) -> bool:
     return False
 
 
-def _start_mcp_servers_background(log_level='ERROR'):
-    """Start MCP servers in a daemon thread. Blocks forever (runs in background)."""
+def _start_mcp_servers_background(log_level='ERROR', config_path=None):
+    """Start MCP servers in a daemon thread. Blocks forever (runs in background).
+
+    Args:
+        log_level: Logging level for MCP servers.
+        config_path: Optional path to an MCP runner config YAML. When None,
+            the built-in default (configs/default.yaml) is used.
+    """
     from .mcp.servers.run import run_servers
     try:
-        run_servers(log_level=log_level)
+        run_servers(config_path=config_path, log_level=log_level)
     except Exception:
         pass
 
@@ -271,10 +277,14 @@ def _ensure_mcp_servers(config_data: dict, log_level='ERROR'):
     if already_running and servers:
         return
 
+    # Resolve MCP runner config (e.g. turtlebot3.yaml vs default)
+    runner_config = config_data.get('mcp', {}).get('runner_config')
+
     # Start MCP servers in a daemon thread
     mcp_thread = threading.Thread(
         target=_start_mcp_servers_background,
         args=(log_level,),
+        kwargs={'config_path': runner_config},
         daemon=True,
     )
     mcp_thread.start()
@@ -353,6 +363,9 @@ def main():
                         help='Local port for Viber webhook server (default: 8443).')
 
     # MCP options
+    parser.add_argument('--mcp', action='store_true', default=False,
+                        help='Start MCP servers only (server mode). Use with --config to specify '
+                             'an MCP runner config YAML. The process will block until interrupted.')
     parser.add_argument('--mcp-host', type=str, default=None,
                         help='Override the host/IP in all MCP server URLs (e.g. 192.168.1.100).')
     parser.add_argument('--ollama-api-key', type=str, default=None,
@@ -363,6 +376,18 @@ def main():
                         help='URL of an external MCP tools server using SSE transport (can be repeated). '
                              'Example: --mcp-sse http://localhost:8080/sse')
     args = parser.parse_args()
+
+    # MCP server-only mode: start MCP servers and block
+    if args.mcp:
+        from .mcp.servers.run import run_servers
+        mcp_config = args.config  # user provides the runner config directly
+        log_level = 'DEBUG' if args.verbose else 'INFO'
+        print(f"Starting MCP servers (config={mcp_config or 'default'})...", file=sys.stderr)
+        try:
+            run_servers(config_path=mcp_config, log_level=log_level)
+        except KeyboardInterrupt:
+            print("\nMCP servers stopped.", file=sys.stderr)
+        return
 
     # Client mode: send task to remote A2A server and exit
     if args.a2a_client:
