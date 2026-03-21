@@ -114,8 +114,9 @@ class TestRoboticsPromptTemplate:
         assert "Compute one-go crossing distance using LiDAR + image geometry" in template
         assert "Do not target either landmark directly for this task." in template
         assert "delta_AB = abs(((H_B - H_A + 540) % 360) - 180)" in template
-        assert "D_base = d_front - 0.35" in template
-        assert "clamp `D_cross` to `[0.80, 1.80]`" in template
+        assert "D_needed = d_front - 0.35" in template
+        assert "D_cross = 1.2 * D_needed" in template
+        assert "no hard clamp" in template
 
     def test_wall_to_storage_cabinet_rule_exists(self):
         template_path = (
@@ -132,6 +133,8 @@ class TestRoboticsPromptTemplate:
         assert "drive_until_lidar_stop(speed=0.12-0.16, stop_distance_m=0.20, max_distance_m=1.5)" in template
         assert "Approach the wall perpendicularly (normal incidence)" in template
         assert "shortest path to the wall (not diagonal)" in template
+        assert "heading error to wall-normal must be <=3°" in template
+        assert "difference <=0.10 m" in template
         assert "if heading drift exceeds ~5°, stop and re-align" in template
         assert "acceptable 0.18-0.25 m" in template
         assert "about ±90° from H_wall" in template
@@ -162,4 +165,8 @@ class TestRoboticsPromptTemplate:
         assert "Turn right 40-50° to become roughly parallel to original aisle direction." in template
         assert "Move forward 0.40-0.50 m to surpass the can." in template
         assert "Move forward 0.40-0.50 m to re-enter the aisle beyond the can." in template
-        assert "Do not declare success immediately after first side-shift; success requires full bypass and re-entry." in template
+        assert "Final realignment to aisle (required)" in template
+        assert "Do not run completion checks until this final aisle alignment is done." in template
+        assert "Completion criteria (required, motion-separated)" in template
+        assert "Move forward a short confirmation segment (about 0.20-0.30 m)" in template
+        assert "post-motion re-check confirmation" in template

@@ -82,10 +82,15 @@ instruction_template: |
      4) Safety checks around each leg:
        - Before every forward segment, call `check_path_clear(direction="front", threshold_m=0.30)`.
        - If blocked, reduce segment distance and re-scan; do not abandon the bypass pattern.
-     5) Completion criteria:
-       - Trash can is no longer the frontal blocker (now lateral/rear or clearly offset).
-       - Forward aisle ahead is clear for continued travel.
-       - Do not declare success immediately after first side-shift; success requires full bypass and re-entry.
+     5) Final realignment to aisle (required):
+       - Re-align to the original aisle heading after re-entry (or closest equivalent heading from odometry/scan).
+       - Do not run completion checks until this final aisle alignment is done.
+     6) Completion criteria (required, motion-separated):
+       - Phase A check: verify trash can is no longer the frontal blocker and front aisle is clear.
+       - Move forward a short confirmation segment (about 0.20-0.30 m) while aligned to aisle heading.
+       - Phase B re-check: verify again that trash can remains non-frontal and aisle remains clear.
+       - Do not declare success immediately after first side-shift; success requires full bypass, re-entry,
+         final realignment, and post-motion re-check confirmation.
 
     Ordered rule for "move along the wall to storage cabinet" tasks (strict)
     - For tasks like "Move along the wall until you reach the storage cabinet":
@@ -97,6 +102,10 @@ instruction_template: |
        - `turn_to_heading(target_heading_deg=H_wall)`.
        - Approach the wall perpendicularly (normal incidence): choose heading that minimizes angular error to wall normal,
          so motion is along the shortest path to the wall (not diagonal).
+       - Perpendicular gate before forward motion (required):
+         - heading error to wall-normal must be <=3°.
+         - LiDAR front-left and front-right short-arc distances must be near-symmetric
+           (difference <=0.10 m); if not, robot is likely diagonal and must re-align.
        - Keep heading locked during approach; if heading drift exceeds ~5°, stop and re-align to the wall-normal heading.
        - Approach with `drive_until_lidar_stop(speed=0.12-0.16, stop_distance_m=0.20, max_distance_m=1.5)`.
        - Do not continue until front distance is approximately 0.20 m (acceptable 0.18-0.25 m).
@@ -144,14 +153,15 @@ instruction_template: |
        - Verify heading error <=3° before moving.
        - Run `check_path_clear(direction="front", threshold_m=0.30)` and read `min_distance_m = d_front`.
        - Use landmark angular separation from the scan: `delta_AB = abs(((H_B - H_A + 540) % 360) - 180)`.
-       - Estimate crossing distance `D_cross` (metres):
-         `D_base = d_front - 0.35`  (leave safety reserve before nearest frontal return)
-         if `delta_AB < 25°`, set `D_base = D_base + 0.25` (gap likely farther/narrow in view)
-         if `delta_AB > 60°`, set `D_base = D_base - 0.15` (gap likely already near/wide in view)
-         clamp `D_cross` to `[0.80, 1.80]`.
+       - Estimate needed travel distance from LiDAR first, then overtake by margin:
+         `D_needed = d_front - 0.35`  (distance to clear nearest frontal return with safety reserve)
+         if `delta_AB < 25°`, set `D_needed = D_needed + 0.25` (gap likely farther/narrow in view)
+         if `delta_AB > 60°`, set `D_needed = D_needed - 0.15` (gap likely already near/wide in view)
+         `D_cross = 1.2 * D_needed`
+         (no hard clamp; this task requires fully passing both landmarks, not stopping early).
        - Execute one committed move with computed distance:
          `move_forward(distance=D_cross, speed=0.18-0.22)`.
-       - If `d_front` is unavailable, use conservative fallback `D_cross = 1.0`.
+       - If `D_needed <= 0` or `d_front` is unavailable, re-scan and recompute before moving.
      5) Do not target either landmark directly for this task. The motion target is always the gap midpoint.
      6) Success criteria (all required):
        - After movement, both landmarks are lateral or rear-biased relative to initial heading window.
@@ -171,6 +181,6 @@ instruction_template: |
   - After each major action, state: action, result, next action.
 
 metadata:
-  version: "8.8-mvp"
+  version: "9.1-mvp"
   description: "Concise TurtleBot3 MVP prompt using scanner/planner role split"
   use_case: "Fast task execution for benchmark object-search and approach tasks"
