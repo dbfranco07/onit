@@ -108,15 +108,21 @@ class TestRoboticsPromptTemplate:
         config = yaml.safe_load(template_path.read_text(encoding="utf-8"))
         template = config["instruction_template"]
 
+        assert "motion target is the connecting line and its ingress point" in template
+        assert "Prefer inference while moving for dynamic scenes" in template
+        assert "Compute the heading in between the two landmarks" in template
         assert "delta = ((H_B - H_A + 540) % 360) - 180" in template
         assert "H_mid = (H_A + delta / 2 + 360) % 360" in template
         assert "Verify heading error <=3° before moving." in template
-        assert "Compute one-go crossing distance using LiDAR + image geometry" in template
-        assert "Do not target either landmark directly for this task." in template
-        assert "delta_AB = abs(((H_B - H_A + 540) % 360) - 180)" in template
-        assert "D_needed = d_front - 0.35" in template
-        assert "D_cross = 1.2 * D_needed" in template
-        assert "no hard clamp" in template
+        assert "Turn to that in-between heading" in template
+        assert "x = d_front" in template
+        assert "D_pass = 1.2 * x" in template
+        assert "D_extra = max(0.60, 0.50 * x)" in template
+        assert "No hard clamp for this task" in template
+        assert "continue forward in additional 0.30-0.60 m segments" in template
+        assert "both landmarks are behind the robot (rear hemisphere confirmation on re-scan)" in template
+        assert "angdiff(H_obj, H_mid) >= 90°" in template
+        assert "Do NOT output planned actions without executing them." in template
 
     def test_wall_to_storage_cabinet_rule_exists(self):
         template_path = (
@@ -129,24 +135,42 @@ class TestRoboticsPromptTemplate:
         config = yaml.safe_load(template_path.read_text(encoding="utf-8"))
         template = config["instruction_template"]
 
-        assert "Ordered rule for \"move along the wall to storage cabinet\" tasks (strict)" in template
-        assert "drive_until_lidar_stop(speed=0.12-0.16, stop_distance_m=0.20, max_distance_m=1.5)" in template
-        assert "Approach the wall perpendicularly (normal incidence)" in template
-        assert "shortest path to the wall (not diagonal)" in template
-        assert "heading error to wall-normal must be <=3°" in template
-        assert "difference <=0.10 m" in template
-        assert "if heading drift exceeds ~5°, stop and re-align" in template
-        assert "acceptable 0.18-0.25 m" in template
-        assert "about ±90° from H_wall" in template
-        assert "move_forward(distance=0.35-0.60, speed=0.16-0.20)" in template
-        assert "move_forward(distance=1.00-1.60, speed=0.18-0.22)" in template
-        assert "Do NOT declare success just because cabinet is visible." in template
-        assert "front clearance >0.8 m" in template
-        assert "no closer non-cabinet obstacle is the primary frontal stop trigger" in template
-        assert "Do not use a single `get_lidar_scan(summarize=true)` front minimum as sole evidence" in template
-        assert "Run heading micro-check around cabinet bearing" in template
-        assert "H_cab-10°, H_cab, H_cab+10°" in template
-        assert "If the closest return shifts to a side heading" in template
+        assert 'Ordered rule for "move along the wall to storage cabinet" tasks (strict)' in template
+        assert "Hard execution order (mandatory)" in template
+        assert "Wall-first is mandatory." in template
+        assert "Do NOT scan for cabinet, turn to cabinet heading," in template
+        assert "or approach cabinet before wall setup is complete." in template
+        assert "acceptable band 0.18-0.22 m" in template
+        assert "Find nearest wall and approach it" in template
+        assert "drive_until_lidar_stop(stop_distance_m=0.20" in template
+        assert "Stop when front lidar is about 0.20 m from the wall" in template
+        assert "Too-near recovery (required)" in template
+        assert "turn(angle=180)" in template
+        assert "move_forward(distance=0.30)" in template
+        assert "Rotate and find cabinet" in template
+        assert "turn_to_heading(target_heading_deg=H_cabinet)" in template
+        assert "Approach cabinet to 0.20-0.30 m" in template
+        assert "Final stop band is 0.20-0.30 m from cabinet." in template
+        assert "follow_wall_lidar" not in template
+
+    def test_patrol_between_lab_chairs_rule_exists(self):
+        template_path = (
+            Path(__file__).resolve().parents[1]
+            / "mcp"
+            / "prompts"
+            / "prompt_templates"
+            / "assistant_robotics.yaml"
+        )
+        config = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+        template = config["instruction_template"]
+
+        assert 'Ordered rule for "patrol between the two lab chairs" tasks (strict)' in template
+        assert "Find two chairs with vision-first search" in template
+        assert "Treat LiDAR as safety-only (chair legs are often sparse/noisy)." in template
+        assert "Patrol 2-3 cycles" in template
+        assert "Approach each chair to ~0.30-0.45 m" in template
+        assert "If LiDAR triggers but chair is off-center, re-align to chair visually and continue in shorter steps." in template
+        assert "Complete after 2 full A↔B cycles; optionally do a 3rd" in template
 
     def test_trash_can_bypass_rule_exists(self):
         template_path = (
@@ -160,11 +184,19 @@ class TestRoboticsPromptTemplate:
         template = config["instruction_template"]
 
         assert "Ordered rule for \"navigate around trash can blocking aisle\" tasks (strict)" in template
-        assert "Turn left 40-50°." in template
-        assert "Move forward 0.40-0.50 m to shift to the left side of the can." in template
-        assert "Turn right 40-50° to become roughly parallel to original aisle direction." in template
-        assert "Move forward 0.40-0.50 m to surpass the can." in template
-        assert "Move forward 0.40-0.50 m to re-enter the aisle beyond the can." in template
+        assert "stop_distance_m=0.30" in template
+        assert "Do not start bypass if already too close (<0.30 m)" in template
+        assert "Use camera as the primary sensor for initial target identification" in template
+        assert "Sensor handoff (required): once near the trash can (about <=0.8 m)" in template
+        assert "switch to LiDAR-dominant local navigation" in template
+        assert "Perform square movement around the can (counterclockwise, required)" in template
+        assert "Leg 1 (left offset edge): turn left 90°, then move forward 0.30 m." in template
+        assert "Leg 2: turn left 90°, then move forward 0.60 m." in template
+        assert "Leg 3: turn left 90°, then move forward 0.60 m." in template
+        assert "Leg 4: turn left 90°, then move forward 0.60 m." in template
+        assert "fixed square-style bypass pattern" in template
+        assert "min_distance_m >= 0.25 m" in template
+        assert "prioritize LiDAR clearance decisions over camera-only proximity impressions" in template
         assert "Final realignment to aisle (required)" in template
         assert "Do not run completion checks until this final aisle alignment is done." in template
         assert "Completion criteria (required, motion-separated)" in template

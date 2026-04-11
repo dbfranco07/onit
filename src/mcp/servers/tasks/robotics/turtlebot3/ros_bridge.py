@@ -1456,6 +1456,160 @@ class TurtleBot3Bridge:
                 "message": f"Error during lidar-stop drive: {e}",
             }
 
+    def follow_wall_lidar(
+        self,
+        distance_m=1.0,
+        side="left",
+        target_wall_distance_m=0.25,
+        speed=0.14,
+        front_stop_distance_m=0.22,
+        wall_lost_distance_m=0.8,
+        max_angular_speed=0.45,
+        k_p=1.8,
+        timeout=None,
+    ):
+        """Move parallel to a wall using LiDAR side-distance feedback.
+
+        Args:
+            distance_m: Desired travel distance along wall.
+            side: Wall side to follow ("left" or "right").
+            target_wall_distance_m: Desired lateral distance from wall.
+            speed: Forward speed in m/s.
+            front_stop_distance_m: Safety stop threshold for front LiDAR.
+            wall_lost_distance_m: Wall considered lost if side distance exceeds this.
+            max_angular_speed: Clamp for angular correction command.
+            k_p: Proportional gain for side-distance error.
+            timeout: Optional command timeout in seconds.
+
+        Returns:
+            dict with status, travelled distance, and stop reason.
+        """
+        if timeout is None:
+            timeout = DEFAULT_MOTION_TIMEOUT
+
+        side = str(side).lower().strip()
+        if side not in ("left", "right"):
+            return {
+                "success": False,
+                "stop_reason": "invalid_side",
+                "message": "side must be 'left' or 'right'",
+            }
+
+        distance_m = max(0.05, float(distance_m))
+        target_wall_distance_m = max(0.08, float(target_wall_distance_m))
+        speed = min(abs(float(speed)), MAX_LINEAR_SPEED)
+        front_stop_distance_m = max(0.10, float(front_stop_distance_m))
+        wall_lost_distance_m = max(target_wall_distance_m + 0.15, float(wall_lost_distance_m))
+        max_angular_speed = min(abs(float(max_angular_speed)), MAX_ANGULAR_SPEED)
+        k_p = max(0.1, float(k_p))
+
+        if not self._wait_for_odom():
+            self.stop()
+            return {
+                "success": False,
+                "stop_reason": "no_odom",
+                "message": "No odometry data available — is the robot running?",
+            }
+
+        start_odom = self.get_odom()
+        sx, sy = start_odom["position"]["x"], start_odom["position"]["y"]
+        start_time = time.monotonic()
+        rate_sleep = 1.0 / CONTROL_HZ
+        side_sign = 1.0 if side == "left" else -1.0
+        lost_wall_ticks = 0
+
+        try:
+            while True:
+                elapsed = time.monotonic() - start_time
+                if elapsed > timeout:
+                    self.stop()
+                    cur = self.get_odom()
+                    cx, cy = cur["position"]["x"], cur["position"]["y"]
+                    dist_actual = math.hypot(cx - sx, cy - sy)
+                    return {
+                        "success": False,
+                        "stop_reason": "timeout",
+                        "distance_requested_m": round(distance_m, 4),
+                        "distance_actual_m": round(dist_actual, 4),
+                        "message": f"Timed out after {timeout}s",
+                    }
+
+                front_dist = self.check_obstacle(direction="front", arc_half_angle_deg=22)
+                if front_dist is not None and front_dist <= front_stop_distance_m:
+                    self.stop()
+                    cur = self.get_odom()
+                    cx, cy = cur["position"]["x"], cur["position"]["y"]
+                    dist_actual = math.hypot(cx - sx, cy - sy)
+                    return {
+                        "success": False,
+                        "stop_reason": "front_obstacle",
+                        "front_distance_m": round(front_dist, 3),
+                        "front_stop_distance_m": round(front_stop_distance_m, 3),
+                        "distance_requested_m": round(distance_m, 4),
+                        "distance_actual_m": round(dist_actual, 4),
+                        "message": (
+                            f"Front obstacle at {front_dist:.2f}m (<= {front_stop_distance_m:.2f}m)."
+                        ),
+                    }
+
+                side_dist = self.check_obstacle(direction=side, arc_half_angle_deg=20)
+                if side_dist is None or side_dist > wall_lost_distance_m:
+                    lost_wall_ticks += 1
+                else:
+                    lost_wall_ticks = 0
+
+                if lost_wall_ticks >= int(CONTROL_HZ * 0.75):
+                    self.stop()
+                    cur = self.get_odom()
+                    cx, cy = cur["position"]["x"], cur["position"]["y"]
+                    dist_actual = math.hypot(cx - sx, cy - sy)
+                    return {
+                        "success": False,
+                        "stop_reason": "wall_lost",
+                        "side": side,
+                        "last_side_distance_m": (
+                            round(side_dist, 3) if isinstance(side_dist, (int, float)) else None
+                        ),
+                        "wall_lost_distance_m": round(wall_lost_distance_m, 3),
+                        "distance_requested_m": round(distance_m, 4),
+                        "distance_actual_m": round(dist_actual, 4),
+                        "message": "Wall signal lost while following; stopping for safety.",
+                    }
+
+                side_error = (side_dist - target_wall_distance_m) if side_dist is not None else 0.0
+                angular_cmd = side_sign * k_p * side_error
+                angular_cmd = max(-max_angular_speed, min(max_angular_speed, angular_cmd))
+
+                cur = self.get_odom()
+                cx, cy = cur["position"]["x"], cur["position"]["y"]
+                dist_actual = math.hypot(cx - sx, cy - sy)
+                if dist_actual >= distance_m:
+                    self.stop()
+                    return {
+                        "success": True,
+                        "stop_reason": "distance_reached",
+                        "side": side,
+                        "target_wall_distance_m": round(target_wall_distance_m, 3),
+                        "last_side_distance_m": (
+                            round(side_dist, 3) if isinstance(side_dist, (int, float)) else None
+                        ),
+                        "distance_requested_m": round(distance_m, 4),
+                        "distance_actual_m": round(dist_actual, 4),
+                        "message": "Completed wall-follow distance.",
+                    }
+
+                angular_ratio = min(1.0, abs(angular_cmd) / max(max_angular_speed, 1e-6))
+                linear_cmd = max(0.05, speed * (1.0 - 0.45 * angular_ratio))
+                self._publish_twist(linear_x=linear_cmd, angular_z=angular_cmd)
+                time.sleep(rate_sleep)
+        except Exception as e:
+            self.stop()
+            return {
+                "success": False,
+                "stop_reason": "error",
+                "message": f"Error during wall-follow: {e}",
+            }
+
     # ------------------------------------------------------------------
     # Camera viewer (MJPEG stream)
     # ------------------------------------------------------------------
@@ -1967,13 +2121,20 @@ class TurtleBot3Bridge:
         if n == 0:
             return None
 
+        angle_min = float(scan.get("angle_min", 0.0))
+        angle_increment = float(scan.get("angle_increment", 0.0))
+        lidar_rotation_deg = float(LIDAR_FRAME_ROTATION_DEG)
+
         # Centre angle for each direction (LDS-02: 0° = front, CCW)
         centres = {"front": 0, "left": 90, "back": 180, "right": 270}
         centre = centres.get(direction, 0)
 
         min_range = float("inf")
         for i, r in enumerate(ranges):
-            angle = (i / n) * 360.0
+            # Use true scan angle with LiDAR-to-robot frame calibration.
+            # This keeps directional obstacle checks aligned with robot "front".
+            beam_rad = angle_min + i * angle_increment
+            angle = (math.degrees(beam_rad) + lidar_rotation_deg) % 360.0
             # Angular distance from centre (handles wrap-around)
             diff = abs(angle - centre)
             if diff > 180:
@@ -2115,11 +2276,17 @@ class TurtleBot3Bridge:
         return True
 
     def move_forward(self, distance_m=0.5, speed=0.2, timeout=None,
-                     safety_margin_m=DEFAULT_SAFETY_MARGIN_M):
+                     safety_margin_m=DEFAULT_SAFETY_MARGIN_M,
+                     reactive_steer=False,
+                     avoidance_angular_speed=0.35):
         """Move forward ``distance_m`` metres at ``speed`` m/s.
 
         Uses trapezoidal velocity ramping for smooth start/stop and
         reactive lidar obstacle checking on every control tick.
+
+        If ``reactive_steer`` is True, the robot applies angular correction
+        while moving forward whenever the frontal clearance enters the safety
+        margin, choosing turn direction from left/right LiDAR clearance.
 
         Returns a dict with ``{success, distance_requested, distance_actual,
         start_position, end_position, message}``.
@@ -2130,6 +2297,7 @@ class TurtleBot3Bridge:
         # Clamp speed to Burger limits
         speed = min(abs(speed), MAX_LINEAR_SPEED)
         distance_m = abs(distance_m)
+        avoidance_angular_speed = min(abs(float(avoidance_angular_speed)), MAX_ANGULAR_SPEED)
 
         if not self._wait_for_odom():
             self.stop()
@@ -2165,6 +2333,43 @@ class TurtleBot3Bridge:
                 # Reactive lidar obstacle check
                 front_dist = self.check_obstacle(direction="front")
                 if front_dist is not None and front_dist < safety_margin_m:
+                    if reactive_steer:
+                        # If the obstacle is critically close, still hard-stop.
+                        hard_stop_dist = max(0.12, safety_margin_m * 0.6)
+                        if front_dist <= hard_stop_dist:
+                            self.stop()
+                            cur = self.get_odom()
+                            cx, cy = cur["position"]["x"], cur["position"]["y"]
+                            dist_actual = math.hypot(cx - sx, cy - sy)
+                            return {
+                                "success": False,
+                                "obstacle_detected": True,
+                                "obstacle_distance_m": round(front_dist, 3),
+                                "distance_requested_m": distance_m,
+                                "distance_actual_m": round(dist_actual, 4),
+                                "start_position": {"x": round(sx, 4), "y": round(sy, 4)},
+                                "end_position": {"x": round(cx, 4), "y": round(cy, 4)},
+                                "reactive_steer": True,
+                                "message": (
+                                    f"Obstacle critically close at {front_dist:.2f}m. "
+                                    f"Stopped after {dist_actual:.3f}m of {distance_m}m."
+                                ),
+                            }
+
+                        left_dist = self.check_obstacle(direction="left")
+                        right_dist = self.check_obstacle(direction="right")
+                        turn_left = (left_dist or 0.0) >= (right_dist or 0.0)
+                        steer_sign = 1.0 if turn_left else -1.0
+
+                        # Slow down while steering through tight space.
+                        steer_linear = max(0.05, min(prev_cmd_speed, speed * 0.6))
+                        self._publish_twist(
+                            linear_x=steer_linear,
+                            angular_z=steer_sign * avoidance_angular_speed,
+                        )
+                        time.sleep(rate_sleep)
+                        continue
+
                     self.stop()
                     cur = self.get_odom()
                     cx, cy = cur["position"]["x"], cur["position"]["y"]

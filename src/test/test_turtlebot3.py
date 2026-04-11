@@ -250,6 +250,45 @@ class TestSensorsWithData:
         assert abs(odom["orientation_yaw_deg"]) < 1.0  # ~0 degrees
 
 
+class TestLidarDirectionalChecks:
+    def _publish_scan(self, bridge, ranges, angle_min=-math.pi, angle_increment=math.pi / 180.0):
+        msg = MagicMock()
+        msg.ranges = ranges
+        msg.angle_min = angle_min
+        msg.angle_max = angle_min + angle_increment * len(ranges)
+        msg.angle_increment = angle_increment
+        msg.range_min = 0.12
+        msg.range_max = 3.5
+        stamp = MagicMock()
+        stamp.sec = 1000
+        stamp.nanosec = 0
+        msg.header.stamp = stamp
+        bridge._lidar_cb(msg)
+
+    def test_check_obstacle_front_uses_angle_and_rotation(self, bridge):
+        ranges = [float("inf")] * 360
+
+        # With angle_min=-180° and LIDAR_FRAME_ROTATION_DEG=-90°,
+        # physical front (0° in robot frame) maps to raw beam angle +90° => index 270.
+        ranges[270] = 0.21
+        self._publish_scan(bridge, ranges)
+
+        front = bridge.check_obstacle(direction="front", arc_half_angle_deg=8)
+        assert front is not None
+        assert abs(front - 0.21) < 1e-6
+
+    def test_check_obstacle_left_uses_angle_and_rotation(self, bridge):
+        ranges = [float("inf")] * 360
+
+        # With the same configuration, robot-left (90°) maps to raw -180° => index 0.
+        ranges[0] = 0.34
+        self._publish_scan(bridge, ranges)
+
+        left = bridge.check_obstacle(direction="left", arc_half_angle_deg=8)
+        assert left is not None
+        assert abs(left - 0.34) < 1e-6
+
+
 class TestFreshFrameWait:
     def _make_stamp(self, sec, nanosec=0):
         stamp = MagicMock()
@@ -588,6 +627,32 @@ class TestMCPTools:
 
         result = json.loads(tb3_mcp.move_forward(distance=-1.0))
         assert "error" in result
+
+    def test_move_forward_with_reactive_steer(self, bridge):
+        import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp
+        tb3_mcp._bridge = bridge
+
+        bridge.move_forward = MagicMock(return_value={
+            "success": True,
+            "distance_requested_m": 0.5,
+            "distance_actual_m": 0.5,
+            "message": "ok",
+        })
+
+        result = json.loads(tb3_mcp.move_forward(
+            distance=0.5,
+            speed=0.2,
+            reactive_steer=True,
+            avoidance_angular_speed=0.3,
+        ))
+
+        assert result["success"] is True
+        bridge.move_forward.assert_called_once_with(
+            distance_m=0.5,
+            speed=0.2,
+            reactive_steer=True,
+            avoidance_angular_speed=0.3,
+        )
 
     def test_turn_zero_angle(self, bridge):
         import src.mcp.servers.tasks.robotics.turtlebot3.mcp_server as tb3_mcp

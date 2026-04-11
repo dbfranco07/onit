@@ -188,6 +188,10 @@ def _argument_context(bridge, tool_name: str, args: dict) -> dict:
                 reasons["distance"] = f"default/planned motion step ({dist})"
         if "speed" in args:
             reasons["speed"] = "chosen to balance stability and safety for indoor navigation"
+        if "reactive_steer" in args:
+            reasons["reactive_steer"] = "enables obstacle-aware steering during forward motion"
+        if "avoidance_angular_speed" in args:
+            reasons["avoidance_angular_speed"] = "turn rate used only when reactive steering engages"
         if "obstacle_threshold_m" in args:
             reasons["obstacle_threshold_m"] = "safety margin for triggering obstacle avoidance"
 
@@ -416,24 +420,38 @@ def get_odometry() -> str:
 def move_forward(
     distance: float = 0.5,
     speed: float = 0.2,
+    reactive_steer: bool = False,
+    avoidance_angular_speed: float = 0.35,
 ) -> str:
     """Move the robot forward.
 
     Args:
         distance: Distance to travel in metres (positive). Default 0.5 m.
         speed: Linear speed in m/s (0 < speed ≤ 0.22). Default 0.2 m/s.
+        reactive_steer: If True, apply angular correction while moving when
+            frontal clearance drops below safety margin.
+        avoidance_angular_speed: Angular speed (rad/s) used by reactive steer.
     """
     if distance <= 0:
         return json.dumps({"error": "Distance must be positive.", "status": "failed"})
     if speed <= 0:
         return json.dumps({"error": "Speed must be positive.", "status": "failed"})
+    if avoidance_angular_speed < 0:
+        return json.dumps({"error": "avoidance_angular_speed must be non-negative.", "status": "failed"})
 
     _trace_tool_call("move_forward", "Advance toward goal in controlled forward motion.", {
         "distance": distance,
         "speed": speed,
+        "reactive_steer": reactive_steer,
+        "avoidance_angular_speed": avoidance_angular_speed,
     })
     bridge = _get_bridge()
-    result = bridge.move_forward(distance_m=distance, speed=speed)
+    result = bridge.move_forward(
+        distance_m=distance,
+        speed=speed,
+        reactive_steer=reactive_steer,
+        avoidance_angular_speed=avoidance_angular_speed,
+    )
     _mark_motion_if_success(result)
     return json.dumps(result, indent=2, default=_json_default)
 
@@ -1504,6 +1522,340 @@ def look_for_target(
 
 
 # =========================================================================
+# HIGH-LEVEL TASK TOOLS
+# =========================================================================
+
+@mcp.tool(
+    title="Navigate to Wall and Cabinet",
+    description=(
+        "Autonomous task: Find the nearest wall, approach it to about 20cm distance, "
+        "scan the environment to identify a storage cabinet, then approach the cabinet "
+        "to 20-30cm distance. Uses LiDAR to locate the wall and vision to identify "
+        "the cabinet. Includes a too-near recovery maneuver before wall approach when needed."
+    ),
+)
+def navigate_to_wall_and_cabinet(
+    wall_approach_distance_m: float = 0.20,
+    cabinet_approach_distance_m: float = 0.25,
+    movement_step_distance_m: float = 0.2,
+    movement_speed_m_s: float = 0.15,
+    wall_follow_max_distance_m: float = 3.0,
+) -> str:
+    """Find nearest wall, set 20cm stand-off, then search/approach cabinet.
+
+    Strategy:
+      1. Find nearest wall from LiDAR and face it.
+      2. If too near wall, recover with: turn 180° -> move 0.30m -> turn 180°.
+      3. Approach wall to ~0.20m using LiDAR stop.
+      4. Rotate/scan to find cabinet with vision.
+      5. Approach cabinet to 0.20-0.30m once cabinet heading is confirmed.
+
+    Args:
+        wall_approach_distance_m: Target wall stand-off distance (default 0.20m).
+        cabinet_approach_distance_m: Final cabinet stand-off distance (default 0.25m).
+        movement_step_distance_m: Retained for API compatibility.
+        movement_speed_m_s: Forward movement speed (default 0.15 m/s).
+        wall_follow_max_distance_m: Deprecated (retained for API compatibility).
+
+    Returns:
+        JSON status with completed wall-first setup and cabinet-search next action.
+    """
+    import time as _time
+
+    _trace_tool_call("navigate_to_wall_and_cabinet", "Wall-first setup then cabinet search/approach.", {
+        "wall_approach_distance_m": wall_approach_distance_m,
+        "cabinet_approach_distance_m": cabinet_approach_distance_m,
+        "movement_speed_m_s": movement_speed_m_s,
+    })
+
+    bridge = _get_bridge()
+    result = {
+        "task": "navigate_to_wall_and_cabinet",
+        "status": "in_progress",
+        "steps": [],
+        "strategy": "wall-first (20cm) with too-near recovery, then vision-led cabinet approach",
+    }
+
+    try:
+        wall_approach_distance_m = max(0.10, float(wall_approach_distance_m))
+        cabinet_approach_distance_m = min(0.30, max(0.20, float(cabinet_approach_distance_m)))
+        movement_speed_m_s = max(0.05, min(0.22, float(movement_speed_m_s)))
+
+        # ===== STEP 1: FIND NEAREST WALL =====
+        result["steps"].append({"step": 1, "action": "Scanning for nearest wall...", "status": "running"})
+        _stderr("Step 1: Finding nearest wall...")
+
+        nearest_candidates = {
+            "front": bridge.check_obstacle(direction="front"),
+            "left": bridge.check_obstacle(direction="left"),
+            "back": bridge.check_obstacle(direction="back"),
+            "right": bridge.check_obstacle(direction="right"),
+        }
+        valid = [(d, v) for d, v in nearest_candidates.items() if isinstance(v, (int, float))]
+        if not valid:
+            result["status"] = "failed"
+            result["steps"][-1]["status"] = "failed"
+            result["error"] = "No LiDAR obstacle data available"
+            return json.dumps(result, indent=2)
+
+        nearest_direction, nearest_distance = min(valid, key=lambda item: item[1])
+        _stderr(f"  Nearest wall: {nearest_direction} at {nearest_distance:.2f}m")
+
+        result["steps"][-1]["status"] = "completed"
+        result["wall_info"] = {
+            "detected_direction": nearest_direction,
+            "distance_m": nearest_distance,
+            "front_distance_m": nearest_candidates.get("front"),
+            "left_distance_m": nearest_candidates.get("left"),
+            "back_distance_m": nearest_candidates.get("back"),
+            "right_distance_m": nearest_candidates.get("right"),
+        }
+
+        # ===== STEP 2: FACE THE WALL =====
+        result["steps"].append({"step": 2, "action": "Turning to face the wall...", "status": "running"})
+        _stderr("Step 2: Turning to face the wall...")
+
+        relative_turn_map = {
+            "front": 0.0,
+            "left": 90.0,
+            "back": 180.0,
+            "right": -90.0,
+        }
+        turn_result = bridge.turn(angle_deg=relative_turn_map.get(nearest_direction, 0.0), angular_speed=0.35)
+        result["steps"][-1]["turn_result"] = turn_result
+        result["steps"][-1]["status"] = "completed"
+
+        # ===== STEP 3: TOO-NEAR RECOVERY + WALL APPROACH TO 20CM =====
+        result["steps"].append({
+            "step": 3,
+            "action": "Ensuring safe wall setup distance (~20cm)",
+            "status": "running"
+        })
+        _stderr(f"Step 3: Approach wall to {wall_approach_distance_m*100:.0f}cm...")
+
+        front_before = bridge.check_obstacle(direction="front", arc_half_angle_deg=20)
+        recovery_applied = False
+
+        too_near_threshold = max(0.05, wall_approach_distance_m - 0.02)
+        if front_before is not None and front_before < too_near_threshold:
+            recovery_applied = True
+            _stderr(
+                "  Too near wall; recovery: turn 180°, move 0.30m, turn 180°"
+            )
+            bridge.turn(angle_deg=180.0, angular_speed=0.35)
+            bridge.move_forward(distance_m=0.30, speed=movement_speed_m_s)
+            bridge.turn(angle_deg=180.0, angular_speed=0.35)
+            _time.sleep(0.15)
+
+        approach_result = bridge.drive_until_lidar_stop(
+            speed=min(0.18, movement_speed_m_s),
+            stop_distance_m=wall_approach_distance_m,
+            max_distance_m=2.0,
+        )
+
+        front_after = bridge.check_obstacle(direction="front", arc_half_angle_deg=20)
+        result["steps"][-1]["status"] = "completed"
+        result["steps"][-1]["recovery_applied"] = recovery_applied
+        result["steps"][-1]["front_before_m"] = front_before
+        result["steps"][-1]["approach_result"] = approach_result
+        result["steps"][-1]["front_after_m"] = front_after
+
+        # ===== STEP 4: ROTATE + FIND CABINET =====
+        result["steps"].append({
+            "step": 4,
+            "action": "Rotate and scan to find cabinet",
+            "status": "running",
+        })
+        _stderr("Step 4: Rotate + scan to find cabinet...")
+
+        scan_output = scan_360_mvp(frame_count=20, settle_time=0.1, speed=0.4)
+        scan_summary = scan_output[0] if isinstance(scan_output, list) and scan_output else str(scan_output)
+
+        result["steps"][-1]["status"] = "completed"
+        result["steps"][-1]["scan_summary"] = str(scan_summary)[:500]
+        result["steps"][-1]["instruction"] = (
+            "Identify cabinet frame and heading from this scan, then turn to that heading."
+        )
+
+        # ===== STEP 5: APPROACH CABINET TO 20-30CM =====
+        result["steps"].append({
+            "step": 5,
+            "action": "Final approach to cabinet 20-30cm distance",
+            "status": "pending_vision_confirmation",
+            "instruction": (
+                "After cabinet heading is confirmed by vision:\n"
+                "  1. turn_to_heading(target_heading_deg=H_cabinet)\n"
+                "  2. drive_until_lidar_stop(stop_distance_m=0.25, max_distance_m=2.0)\n"
+                "  3. Ensure final range is in 0.20-0.30m and cabinet is centered in camera"
+            )
+        })
+
+        result["status"] = "partial_completion"
+        result["message"] = (
+            "Completed wall-first setup at ~20cm, including too-near recovery when needed. "
+            "Completed 360° scan for cabinet finding. Awaiting visual cabinet heading confirmation "
+            "for final 20-30cm cabinet approach."
+        )
+        result["next_action"] = (
+            "Identify cabinet heading from scan, turn to that heading, then execute LiDAR stop approach "
+            "to ~0.25m and verify cabinet is centered."
+        )
+        result["targets"] = {
+            "wall_approach_distance_m": wall_approach_distance_m,
+            "cabinet_approach_band_m": [0.20, 0.30],
+            "cabinet_nominal_stop_m": cabinet_approach_distance_m,
+        }
+
+        return json.dumps(result, indent=2, default=_json_default)
+
+    except Exception as e:
+        result["status"] = "failed"
+        result["error"] = str(e)
+        _stderr(f"Task failed: {e}")
+        return json.dumps(result, indent=2)
+
+
+@mcp.tool(
+    title="Patrol Between Chairs",
+    description=(
+        "Autonomous task: Perform a 360° scan to identify two lab chairs, then patrol "
+        "between them by moving back and forth 2-3 times. Uses vision to identify chairs "
+        "and approach them. The robot stops at a reasonable distance from each chair "
+        "(approximately 0.5-0.7m based on chair detection confidence)."
+    ),
+)
+def patrol_between_chairs(
+    patrol_iterations: int = 2,
+    chair_approach_distance_m: float = 0.5,
+    movement_speed_m_s: float = 0.18,
+    search_timeout_s: float = 30.0,
+) -> str:
+    """Find two lab chairs and patrol between them.
+
+    Args:
+        patrol_iterations: Number of round trips between chairs (default 2).
+        chair_approach_distance_m: Distance to stop from each chair (default 0.5m).
+        movement_speed_m_s: Speed during forward movement (default 0.18 m/s).
+        search_timeout_s: Maximum time to wait for chair detection (default 30s).
+
+    Returns:
+        JSON with patrol status, chair locations, and iteration count.
+    """
+    import time as _time
+
+    _trace_tool_call("patrol_between_chairs", "Autonomous chair patrol task.", {
+        "patrol_iterations": patrol_iterations,
+        "chair_approach_distance_m": chair_approach_distance_m,
+    })
+
+    bridge = _get_bridge()
+    result = {
+        "task": "patrol_between_chairs",
+        "status": "in_progress",
+        "steps": [],
+        "detected_chairs": [],
+        "patrol_log": [],
+    }
+
+    try:
+        # ===== STEP 1: SCAN FOR CHAIRS =====
+        result["steps"].append({"step": 1, "action": "Performing 360° scan to find chairs...", "status": "running"})
+        _stderr("Step 1: Scanning for lab chairs...")
+
+        scan_output = rotate_and_scan(
+            total_angle=360.0,
+            step_angle=24.0,  # 15 frames for good coverage
+            settle_time=0.2,
+            speed=0.3,
+        )
+
+        if isinstance(scan_output, list) and len(scan_output) >= 2:
+            summary_text = scan_output[0]
+            panorama_image = scan_output[1]
+            result["steps"][-1]["status"] = "completed"
+            result["steps"][-1]["scan_summary"] = summary_text[:300] + "..."
+            result["scan_image"] = "captured (use vision to identify chairs)"
+            _stderr(f"  Panorama captured for chair detection")
+        else:
+            result["steps"][-1]["status"] = "failed"
+            result["status"] = "failed"
+            result["error"] = "Failed to capture panorama scan"
+            return json.dumps(result, indent=2)
+
+        # ===== STEP 2: IDENTIFY CHAIRS (VLM instruction) =====
+        result["steps"].append({
+            "step": 2,
+            "action": "Identify two lab chairs in panorama",
+            "status": "pending_vision_analysis",
+            "instruction": "Analyze the panorama contact sheet carefully. "
+                           "Find TWO lab chairs - look for seat, backrest, and legs. "
+                           "Report: [Frame number 1] at heading X°, [Frame number 2] at heading Y°. "
+                           "Describe color, size, and distinguishing features of each chair."
+        })
+        _stderr("Step 2: Chair identification delegated to vision analysis...")
+
+        result["detected_chairs_placeholder"] = [
+            {
+                "chair_number": 1,
+                "heading_deg": "TO_BE_DETERMINED_BY_VISION",
+                "frame_number": "TO_BE_DETERMINED_BY_VISION",
+                "description": "TO_BE_DETERMINED_BY_VISION"
+            },
+            {
+                "chair_number": 2,
+                "heading_deg": "TO_BE_DETERMINED_BY_VISION",
+                "frame_number": "TO_BE_DETERMINED_BY_VISION",
+                "description": "TO_BE_DETERMINED_BY_VISION"
+            }
+        ]
+
+        # ===== STEP 3-N: PATROL LOGIC (awaiting chair headings) =====
+        result["steps"].append({
+            "step": 3,
+            "action": f"Execute {patrol_iterations} patrol iterations between chairs",
+            "status": "pending_chair_confirmation",
+            "instruction": f"Once both chair headings are confirmed from vision analysis, execute the following loop {patrol_iterations} times:\n"
+                           f"  1. turn_to_heading(chair1_heading)\n"
+                           f"  2. move_forward() with lidar monitoring until {chair_approach_distance_m}m distance\n"
+                           f"  3. Capture camera image for verification\n"
+                           f"  4. turn_to_heading(chair2_heading)\n"
+                           f"  5. move_forward() with lidar monitoring until {chair_approach_distance_m}m distance\n"
+                           f"  6. Capture camera image for verification\n"
+                           f"  7. Repeat"
+        })
+
+        result["steps"].append({
+            "step": 4,
+            "action": "Return to starting position",
+            "status": "pending",
+            "instruction": "After completing all patrol iterations, return to the initial starting position via reverse navigation."
+        })
+
+        result["status"] = "partial_completion"
+        result["next_action"] = (
+            "Analyze panorama to find TWO lab chairs. "
+            "Report their headings. Then execute patrol loop."
+        )
+        result["message"] = (
+            "360° panorama captured successfully for chair detection. "
+            "Panorama image attached for analysis. "
+            "Awaiting vision confirmation of chair locations before patrol begins."
+        )
+        result["expected_patrol_phases"] = [
+            f"Phase 1-{patrol_iterations}: Move to chair 1 → Move to chair 2 (repeat {patrol_iterations} times)",
+            f"Phase {patrol_iterations + 1}: Return to start"
+        ]
+
+        return json.dumps(result, indent=2, default=_json_default)
+
+    except Exception as e:
+        result["status"] = "failed"
+        result["error"] = str(e)
+        _stderr(f"Task failed: {e}")
+        return json.dumps(result, indent=2)
+
+
+# =========================================================================
 # HELPERS
 # =========================================================================
 
@@ -1682,8 +2034,10 @@ def run(
 
     logger.info(f"Starting TurtleBot3 MCP Server at {host}:{port}{path}")
     logger.info(
-        "11 Tools: get_camera_image, get_lidar_scan, get_odometry, check_path_clear, "
-        "move_forward, turn, drive_until_lidar_stop, stop, open_camera_viewer, describe_scan_image, diagnose_ros, scan_step"
+        "13 Tools: get_camera_image, get_lidar_scan, get_odometry, check_path_clear, "
+        "move_forward, turn, turn_to_heading, stop, drive_until_lidar_stop, "
+        "rotate_and_scan, look_for_target, scan_step, "
+        "navigate_to_wall_and_cabinet, patrol_between_chairs"
     )
 
     if not verbose:

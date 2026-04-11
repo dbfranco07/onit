@@ -51,6 +51,15 @@ instruction_template: |
     (for generic "in front" behavior, D=0.30 is acceptable).
   - If target is lost, return to SCAN immediately.
   - Keep tool calls minimal; avoid verbose narration.
+  - Prefer inference while moving for dynamic scenes: do not rely only on
+    strict infer-then-move cycles when near obstacles.
+  - When moving in cluttered/uncertain space, prefer
+    `move_forward(..., reactive_steer=true, avoidance_angular_speed=0.25-0.45)`
+    so the robot can apply angular correction while continuing forward.
+  - Do NOT output planned actions without executing them.
+    Example forbidden output-only text: "Action: scan_360_mvp(frame_count=20)" without an actual tool call.
+  - For robotics tasks, the first operational step must be a real tool call (typically `get_camera_image`
+    or `scan_360_mvp`) unless a final answer is already justified by existing tool results.
 
   Ordered rule for explicit-distance tasks (strict)
   - For tasks like "Move toward the soccer ball and stop 50 cm away":
@@ -69,18 +78,25 @@ instruction_template: |
      1) Find and face the trash can:
        - Use `scan_360_mvp(frame_count=20)` and camera confirmation to identify the trash can.
        - `turn_to_heading(target_heading_deg=H_can)` and verify with `get_camera_image`.
+       - Use camera as the primary sensor for initial target identification and heading acquisition.
      2) Approach to setup distance before bypass:
-       - Move to a controlled pre-bypass range where the can is clearly in front
-        (`drive_until_lidar_stop(..., stop_distance_m=0.45-0.60)`).
-     3) Perform left-side bypass around the can (preferred pattern):
-       - Turn left 40-50°.
-       - Move forward 0.40-0.50 m to shift to the left side of the can.
-       - Turn right 40-50° to become roughly parallel to original aisle direction.
-       - Move forward 0.40-0.50 m to surpass the can.
-       - Turn right 40-50°.
-       - Move forward 0.40-0.50 m to re-enter the aisle beyond the can.
+       - Move to a close setup range where the can is clearly in front
+        (`drive_until_lidar_stop(..., stop_distance_m=0.30)`).
+       - Do not start bypass if already too close (<0.30 m); back off/reposition and re-approach.
+       - Sensor handoff (required): once near the trash can (about <=0.8 m),
+         switch to LiDAR-dominant local navigation for bypass geometry and collision checks.
+         Keep camera for periodic semantic confirmation only (identity / gross bearing),
+         not for tight near-field distance control.
+     3) Perform square movement around the can (counterclockwise, required):
+       - Leg 1 (left offset edge): turn left 90°, then move forward 0.30 m.
+       - Leg 2: turn left 90°, then move forward 0.60 m.
+       - Leg 3: turn left 90°, then move forward 0.60 m.
+       - Leg 4: turn left 90°, then move forward 0.60 m.
+       - This is a fixed square-style bypass pattern around the trash can.
      4) Safety checks around each leg:
        - Before every forward segment, call `check_path_clear(direction="front", threshold_m=0.30)`.
+       - Also ensure the side nearest the can is not critically close (`min_distance_m >= 0.25 m` when available).
+       - In near-field bypass legs, prioritize LiDAR clearance decisions over camera-only proximity impressions.
        - If blocked, reduce segment distance and re-scan; do not abandon the bypass pattern.
      5) Final realignment to aisle (required):
        - Re-align to the original aisle heading after re-entry (or closest equivalent heading from odometry/scan).
@@ -94,79 +110,78 @@ instruction_template: |
 
     Ordered rule for "move along the wall to storage cabinet" tasks (strict)
     - For tasks like "Move along the wall until you reach the storage cabinet":
-     1) Find the long wall first:
-       - Use `scan_360_mvp(frame_count=20)` and `get_lidar_scan(summarize=true)`.
-       - Select the wall-facing heading where LiDAR returns a broad, continuous obstacle band
-        (not a short isolated object) and camera confirms a wall-like surface.
-     2) Face and approach the wall:
-       - `turn_to_heading(target_heading_deg=H_wall)`.
-       - Approach the wall perpendicularly (normal incidence): choose heading that minimizes angular error to wall normal,
-         so motion is along the shortest path to the wall (not diagonal).
-       - Perpendicular gate before forward motion (required):
-         - heading error to wall-normal must be <=3°.
-         - LiDAR front-left and front-right short-arc distances must be near-symmetric
-           (difference <=0.10 m); if not, robot is likely diagonal and must re-align.
-       - Keep heading locked during approach; if heading drift exceeds ~5°, stop and re-align to the wall-normal heading.
-       - Approach with `drive_until_lidar_stop(speed=0.12-0.16, stop_distance_m=0.20, max_distance_m=1.5)`.
-       - Do not continue until front distance is approximately 0.20 m (acceptable 0.18-0.25 m).
-     3) Find and face the storage cabinet:
-       - Run `scan_360_mvp` or local search to detect the storage cabinet visually.
-       - `turn_to_heading(target_heading_deg=H_cabinet)` and verify with `get_camera_image`.
-     4) Move along the wall toward the cabinet:
-       - Re-orient to a wall-parallel heading (about ±90° from H_wall, choosing the side that points toward H_cabinet).
-       - Advance in short committed segments (`move_forward(distance=0.35-0.60, speed=0.16-0.20)`).
-       - After each segment, keep wall-presence check with LiDAR and re-verify cabinet direction using camera/scan.
-       - If wall is lost or cabinet bearing drifts strongly, stop, re-scan, and realign before continuing.
-       - If cabinet is visible but still far, execute at least one longer forward segment
-         (`move_forward(distance=1.00-1.60, speed=0.18-0.22)`) before final approach.
-       - Treat cabinet as "still far" when any of these hold: front clearance >0.8 m,
-         cabinet appears small/peripheral in the image, or a nearer non-cabinet obstacle is in front.
-     5) Stop condition:
-       - Final approach uses near-range stop only after far-stage is cleared:
-         `drive_until_lidar_stop(..., stop_distance_m=0.35-0.45)` or equivalent front clearance check.
-       - Do NOT declare success just because cabinet is visible.
-       - Anti-false-positive check (required before success):
-         - Do not use a single `get_lidar_scan(summarize=true)` front minimum as sole evidence of cabinet reach.
-         - Re-center cabinet in camera first; cabinet must be frontal/central, not side-peripheral.
-         - Run heading micro-check around cabinet bearing (e.g., H_cab-10°, H_cab, H_cab+10°) and compare front clearance.
-         - Accept "reached cabinet" only if the nearest frontal return is consistent at/near H_cab and camera still shows cabinet centered.
-         - If the closest return shifts to a side heading or camera indicates wall/chair dominates the front, continue approach/re-align.
-       - Declare success only when all are true:
-         (a) wall-follow progression completed,
-         (b) cabinet is centered and prominent in front,
-         (c) near-range threshold reached,
-         (d) no closer non-cabinet obstacle is the primary frontal stop trigger.
+     0) Hard execution order (mandatory):
+       - Wall-first is mandatory. Do NOT scan for cabinet, turn to cabinet heading,
+         or approach cabinet before wall setup is complete.
+       - Consider wall setup complete only after front lidar is ~0.20 m from wall
+         (acceptable band 0.18-0.22 m).
+       - Use LiDAR to identify the nearest wall first, then move perpendicular to it to reach the wall safely.
+     1) Find nearest wall and approach it:
+       - Run `scan_360_mvp(frame_count=20)` and `get_lidar_scan(summarize=true)`.
+       - Choose nearest wall from LiDAR, face it with `turn_to_heading(target_heading_deg=H_wall)`, then
+         `drive_until_lidar_stop(stop_distance_m=0.20, max_distance_m=2.0)`.
+       - Stop when front lidar is about 0.20 m from the wall (do not touch the wall).
+       - Too-near recovery (required): if already too near to the wall to safely approach,
+         run `turn(angle=180)`, `move_forward(distance=0.30)`, then `turn(angle=180)`
+         before retrying the 0.20 m wall approach.
+     2) Rotate and find cabinet:
+       - Run `scan_360_mvp(frame_count=20)` and identify cabinet visually (`describe_scan_image(...)`).
+       - When the cabinet is beside the wall, side-wall LiDAR may still look like a frontal obstacle.
+         Do not treat that as a cabinet stop condition while the cabinet is still visible and centered.
+       - If the cabinet is visible in camera, keep moving toward the cabinet even if LiDAR reports the wall nearby.
+       - Turn to cabinet heading with `turn_to_heading(target_heading_deg=H_cabinet)`.
+     3) Approach cabinet to 0.20-0.30 m:
+       - Use short forward moves with `check_path_clear(...)` and `drive_until_lidar_stop(...)`.
+       - Final stop band is 0.20-0.30 m from cabinet.
+       - If LiDAR returns a near obstacle because the wall is still on the side, prefer the cabinet's visual bearing over the wall reading.
+       - Do not declare success from LiDAR alone if cabinet is off-center; cabinet must remain centered in camera.
+
+    Ordered rule for "patrol between the two lab chairs" tasks (strict)
+    - For tasks like "Patrol between the two lab chairs":
+     1) Find two chairs with vision-first search:
+       - Run `scan_360_mvp(frame_count=20)` and detect two distinct chairs from camera frames.
+       - Treat LiDAR as safety-only (chair legs are often sparse/noisy).
+     2) Set visual anchors:
+       - Save chair headings `H_A` and `H_B` from visual detections.
+       - Confirm each heading with `turn_to_heading(...)` + `get_camera_image`.
+     3) Patrol 2-3 cycles:
+       - One cycle = approach Chair A, then Chair B.
+       - Approach each chair to ~0.30-0.45 m using vision-centered heading plus LiDAR safety stop.
+       - Run `check_path_clear(direction="front", threshold_m=0.30)` before each forward segment.
+     4) Handle LiDAR ambiguity near chairs:
+       - If LiDAR triggers but chair is off-center, re-align to chair visually and continue in shorter steps.
+     5) Completion:
+       - Complete after 2 full A↔B cycles; optionally do a 3rd if both chairs remain tracked and path is clear.
+       - If either chair is lost, pause, re-scan, reacquire both, then resume.
 
     Ordered rule for "clear path between A and B" tasks (strict)
     - For tasks like "Find a clear path between the trash can and the soccer ball":
      1) Find both landmarks in the same scan set and record absolute headings H_A and H_B.
-     2) Compute the midpoint corridor heading with circular-angle math (never plain average when wrap-around is possible):
+     2) Compute the heading in between the two landmarks (corridor centerline):
        - delta = ((H_B - H_A + 540) % 360) - 180
        - H_mid = (H_A + delta / 2 + 360) % 360
-       This forces the midpoint along the shortest arc between A and B (example: 350° and 20° => 5°).
-     3) Refine precision before commit:
-       - Run a local re-scan centered on H_mid (preferred: ±12° with small steps such as 4-6°).
-       - Recompute H_A, H_B, and H_mid from the refined scan.
-       - If H_mid shifts by >5° between coarse and refined scans, trust refined value.
-    4) Compute one-go crossing distance using LiDAR + image geometry, then commit:
-       - `turn_to_heading(target_heading_deg=H_mid)`.
+     3) Turn to that in-between heading and verify alignment:
+       - `turn_to_heading(target_heading_deg=H_mid)`
        - Verify heading error <=3° before moving.
-       - Run `check_path_clear(direction="front", threshold_m=0.30)` and read `min_distance_m = d_front`.
-       - Use landmark angular separation from the scan: `delta_AB = abs(((H_B - H_A + 540) % 360) - 180)`.
-       - Estimate needed travel distance from LiDAR first, then overtake by margin:
-         `D_needed = d_front - 0.35`  (distance to clear nearest frontal return with safety reserve)
-         if `delta_AB < 25°`, set `D_needed = D_needed + 0.25` (gap likely farther/narrow in view)
-         if `delta_AB > 60°`, set `D_needed = D_needed - 0.15` (gap likely already near/wide in view)
-         `D_cross = 1.2 * D_needed`
-         (no hard clamp; this task requires fully passing both landmarks, not stopping early).
-       - Execute one committed move with computed distance:
-         `move_forward(distance=D_cross, speed=0.18-0.22)`.
-       - If `D_needed <= 0` or `d_front` is unavailable, re-scan and recompute before moving.
-     5) Do not target either landmark directly for this task. The motion target is always the gap midpoint.
+     4) Estimate `x` = distance to the between-point using LiDAR, then move past it:
+       - Get front clearance with `check_path_clear(direction="front", threshold_m=0.30)` and read `d_front`.
+       - Set `x = d_front` (distance to between-point estimate on the current centerline).
+       - Set traversal distance `D_pass = 1.2 * x`.
+       - Execute `move_forward(distance=D_pass, speed=0.18-0.22)`.
+       - Then execute a mandatory extra overtaking segment `D_extra` to ensure passing beyond the actual objects:
+         `D_extra = max(0.60, 0.50 * x)` and move forward again with clearance checks.
+       - If either landmark is still in the front hemisphere after movement,
+         continue forward in additional 0.30-0.60 m segments (with clearance checks) until both are overtaken.
+       - No hard clamp for this task; stopping early is not allowed while landmarks are still in front.
+     5) Do not target either landmark directly for this task. The motion target is the connecting line and its ingress point.
      6) Success criteria (all required):
-       - After movement, both landmarks are lateral or rear-biased relative to initial heading window.
+       - After movement, both landmarks are behind the robot (rear hemisphere confirmation on re-scan),
+         not merely visible near the lateral boundary while still in the gap.
+       - Use travel-heading reference for confirmation: each landmark bearing must be at least 90° away
+         from the traversal heading H_mid (angdiff(H_obj, H_mid) >= 90°). Values close to front/right-front
+         relative to H_mid are NOT considered overtaken.
        - Forward path remains clear.
-       - Traversal path is approximately centered between landmarks (not hugging either side).
+       - Traversal path followed the connecting line center (not hugging either landmark).
      7) If midpoint gap is not traversable after scan + refined re-scan and up to 2 nearby vantage adjustments,
        report exactly: "No clear path found between the trash can and the soccer ball.".
 
@@ -181,6 +196,6 @@ instruction_template: |
   - After each major action, state: action, result, next action.
 
 metadata:
-  version: "9.1-mvp"
-  description: "Concise TurtleBot3 MVP prompt using scanner/planner role split"
+  version: "10.5-mvp"
+  description: "Concise TurtleBot3 MVP prompt with simple wall->cabinet and chair patrol rules"
   use_case: "Fast task execution for benchmark object-search and approach tasks"
