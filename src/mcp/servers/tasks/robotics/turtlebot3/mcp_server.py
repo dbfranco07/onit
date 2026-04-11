@@ -354,11 +354,13 @@ def get_lidar_scan(
         "front_right": _range_stats(ranges, 0, n, -45, -12),
     }
     side_wall_risk = _detect_side_wall_stop_risk(ranges, n)
+    nearest_wall = _nearest_lidar_return(ranges, n)
 
     return json.dumps({
         "quadrants": quadrants,
         "frontal_profile": frontal_profile,
         "side_wall_risk": side_wall_risk,
+        "nearest_wall": nearest_wall,
         "total_points": n,
         "range_min_m": scan["range_min"],
         "range_max_m": scan["range_max"],
@@ -647,6 +649,67 @@ def drive_until_lidar_stop(
         speed=speed,
         stop_distance_m=stop_distance_m,
         max_distance_m=max_distance_m,
+    )
+    if isinstance(result, dict):
+        side_wall_guard = _build_side_wall_guard(bridge, stop_distance_m=stop_distance_m)
+        if side_wall_guard:
+            result["side_wall_guard"] = side_wall_guard
+    _mark_motion_if_success(result)
+    return json.dumps(result, indent=2, default=_json_default)
+
+
+@mcp.tool(
+    title="Follow Wall LiDAR",
+    description=(
+        "Move parallel to a wall using LiDAR side-distance feedback. "
+        "Use this when tasks require stable wall-follow behavior instead of "
+        "repeated turn/drive micro-steps."
+    ),
+)
+def follow_wall_lidar(
+    distance_m: float = 1.0,
+    side: str = "left",
+    target_wall_distance_m: float = 0.25,
+    speed: float = 0.14,
+    front_stop_distance_m: float = 0.22,
+    wall_lost_distance_m: float = 0.8,
+    max_angular_speed: float = 0.45,
+    k_p: float = 1.8,
+) -> str:
+    """Follow a wall with closed-loop LiDAR control.
+
+    Args:
+        distance_m: Requested travel distance along the wall.
+        side: Wall side to follow ('left' or 'right').
+        target_wall_distance_m: Desired lateral wall stand-off distance.
+        speed: Nominal forward speed in m/s.
+        front_stop_distance_m: Safety stop threshold for front obstacle.
+        wall_lost_distance_m: Consider wall signal lost above this distance.
+        max_angular_speed: Clamp for angular correction command.
+        k_p: Proportional gain for side-distance error.
+    """
+    side = str(side).lower().strip()
+    if side not in ("left", "right"):
+        return json.dumps({"error": "side must be 'left' or 'right'", "status": "failed"})
+
+    _trace_tool_call("follow_wall_lidar", "Closed-loop wall following using LiDAR side distance.", {
+        "distance_m": distance_m,
+        "side": side,
+        "target_wall_distance_m": target_wall_distance_m,
+        "speed": speed,
+        "front_stop_distance_m": front_stop_distance_m,
+    })
+
+    bridge = _get_bridge()
+    result = bridge.follow_wall_lidar(
+        distance_m=distance_m,
+        side=side,
+        target_wall_distance_m=target_wall_distance_m,
+        speed=speed,
+        front_stop_distance_m=front_stop_distance_m,
+        wall_lost_distance_m=wall_lost_distance_m,
+        max_angular_speed=max_angular_speed,
+        k_p=k_p,
     )
     _mark_motion_if_success(result)
     return json.dumps(result, indent=2, default=_json_default)
@@ -1585,26 +1648,41 @@ def navigate_to_wall_and_cabinet(
         result["steps"].append({"step": 1, "action": "Scanning for nearest wall...", "status": "running"})
         _stderr("Step 1: Finding nearest wall...")
 
+        scan = bridge.get_lidar() or {}
+        ranges = scan.get("ranges") or []
+        if not ranges:
+            result["status"] = "failed"
+            result["steps"][-1]["status"] = "failed"
+            result["error"] = "No LiDAR obstacle data available"
+            return json.dumps(result, indent=2)
+
+        nearest_wall = _nearest_lidar_return(ranges, len(ranges))
+        nearest_direction = nearest_wall.get("approx_direction")
+        nearest_distance = nearest_wall.get("distance_m")
+        nearest_heading = nearest_wall.get("relative_heading_deg")
+
+        if nearest_heading is None or nearest_distance is None:
+            result["status"] = "failed"
+            result["steps"][-1]["status"] = "failed"
+            result["error"] = "Could not determine nearest wall heading from LiDAR"
+            return json.dumps(result, indent=2)
+
+        _stderr(
+            f"  Nearest wall: heading {nearest_heading:.1f}° ({nearest_direction}) at {nearest_distance:.2f}m"
+        )
+
         nearest_candidates = {
             "front": bridge.check_obstacle(direction="front"),
             "left": bridge.check_obstacle(direction="left"),
             "back": bridge.check_obstacle(direction="back"),
             "right": bridge.check_obstacle(direction="right"),
         }
-        valid = [(d, v) for d, v in nearest_candidates.items() if isinstance(v, (int, float))]
-        if not valid:
-            result["status"] = "failed"
-            result["steps"][-1]["status"] = "failed"
-            result["error"] = "No LiDAR obstacle data available"
-            return json.dumps(result, indent=2)
-
-        nearest_direction, nearest_distance = min(valid, key=lambda item: item[1])
-        _stderr(f"  Nearest wall: {nearest_direction} at {nearest_distance:.2f}m")
 
         result["steps"][-1]["status"] = "completed"
         result["wall_info"] = {
             "detected_direction": nearest_direction,
             "distance_m": nearest_distance,
+            "relative_heading_deg": nearest_heading,
             "front_distance_m": nearest_candidates.get("front"),
             "left_distance_m": nearest_candidates.get("left"),
             "back_distance_m": nearest_candidates.get("back"),
@@ -1615,13 +1693,7 @@ def navigate_to_wall_and_cabinet(
         result["steps"].append({"step": 2, "action": "Turning to face the wall...", "status": "running"})
         _stderr("Step 2: Turning to face the wall...")
 
-        relative_turn_map = {
-            "front": 0.0,
-            "left": 90.0,
-            "back": 180.0,
-            "right": -90.0,
-        }
-        turn_result = bridge.turn(angle_deg=relative_turn_map.get(nearest_direction, 0.0), angular_speed=0.35)
+        turn_result = bridge.turn(angle_deg=float(nearest_heading), angular_speed=0.35)
         result["steps"][-1]["turn_result"] = turn_result
         result["steps"][-1]["status"] = "completed"
 
@@ -1902,6 +1974,73 @@ def _range_stats(ranges, start_idx, total, angle_start_deg, angle_end_deg):
     }
 
 
+def _nearest_lidar_return(ranges, total):
+    """Return nearest valid LiDAR hit with relative heading in robot frame."""
+    import math
+
+    best_idx = None
+    best_range = None
+    for i, r in enumerate(ranges):
+        if math.isinf(r) or r <= 0:
+            continue
+        if best_range is None or r < best_range:
+            best_range = r
+            best_idx = i
+
+    if best_idx is None or best_range is None:
+        return {
+            "distance_m": None,
+            "relative_heading_deg": None,
+            "approx_direction": None,
+            "index": None,
+        }
+
+    angle_360 = (best_idx / total) * 360.0
+    relative_heading = ((angle_360 + 180.0) % 360.0) - 180.0
+
+    if -45.0 <= relative_heading <= 45.0:
+        approx_direction = "front"
+    elif 45.0 < relative_heading <= 135.0:
+        approx_direction = "left"
+    elif -135.0 <= relative_heading < -45.0:
+        approx_direction = "right"
+    else:
+        approx_direction = "back"
+
+    return {
+        "distance_m": round(best_range, 3),
+        "relative_heading_deg": round(relative_heading, 2),
+        "approx_direction": approx_direction,
+        "index": best_idx,
+    }
+
+
+def _build_side_wall_guard(bridge, stop_distance_m):
+    """Annotate lidar-stop result with side-wall domination hints."""
+    scan = bridge.get_lidar()
+    if not scan or not isinstance(scan, dict):
+        return None
+
+    ranges = scan.get("ranges") or []
+    total = len(ranges)
+    if not ranges:
+        return None
+
+    side_wall_risk = _detect_side_wall_stop_risk(ranges, total)
+    front_center_m = bridge.check_obstacle(direction="front", arc_half_angle_deg=8)
+    continue_hint = bool(
+        side_wall_risk.get("likely") and
+        isinstance(front_center_m, (int, float)) and
+        front_center_m > (float(stop_distance_m) + 0.05)
+    )
+
+    return {
+        "side_wall_risk": side_wall_risk,
+        "front_center_m": round(front_center_m, 3) if isinstance(front_center_m, (int, float)) else None,
+        "continue_if_visual_target_locked": continue_hint,
+    }
+
+
 def _detect_side_wall_stop_risk(ranges, total):
     front_center = _range_stats(ranges, 0, total, -12, 12)
     front_left = _range_stats(ranges, 0, total, 12, 45)
@@ -2034,8 +2173,8 @@ def run(
 
     logger.info(f"Starting TurtleBot3 MCP Server at {host}:{port}{path}")
     logger.info(
-        "13 Tools: get_camera_image, get_lidar_scan, get_odometry, check_path_clear, "
-        "move_forward, turn, turn_to_heading, stop, drive_until_lidar_stop, "
+        "15 Tools: get_camera_image, get_lidar_scan, get_odometry, check_path_clear, "
+        "move_forward, turn, turn_to_heading, stop, drive_until_lidar_stop, follow_wall_lidar, "
         "rotate_and_scan, look_for_target, scan_step, "
         "navigate_to_wall_and_cabinet, patrol_between_chairs"
     )

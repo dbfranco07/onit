@@ -113,27 +113,31 @@ instruction_template: |
      0) Hard execution order (mandatory):
        - Wall-first is mandatory. Do NOT scan for cabinet, turn to cabinet heading,
          or approach cabinet before wall setup is complete.
-       - Consider wall setup complete only after front lidar is ~0.20 m from wall
-         (acceptable band 0.18-0.22 m).
+       - Consider wall setup complete only after front lidar is in 0.20-0.30 m band
+         (target nominal 0.25 m).
        - Use LiDAR to identify the nearest wall first, then move perpendicular to it to reach the wall safely.
      1) Find nearest wall and approach it:
        - Run `scan_360_mvp(frame_count=20)` and `get_lidar_scan(summarize=true)`.
-       - Choose nearest wall from LiDAR, face it with `turn_to_heading(target_heading_deg=H_wall)`, then
-         `drive_until_lidar_stop(stop_distance_m=0.20, max_distance_m=2.0)`.
-       - Stop when front lidar is about 0.20 m from the wall (do not touch the wall).
+       - Choose nearest wall from LiDAR nearest return heading (`nearest_wall.relative_heading_deg`) and face it
+         with `turn(angle=nearest_wall.relative_heading_deg)` to ensure perpendicular approach.
+       - Approach with `drive_until_lidar_stop(stop_distance_m=0.25, max_distance_m=2.0)`.
+       - Stop when front lidar is in 0.20-0.30 m band from the wall (do not touch the wall).
        - Too-near recovery (required): if already too near to the wall to safely approach,
          run `turn(angle=180)`, `move_forward(distance=0.30)`, then `turn(angle=180)`
-         before retrying the 0.20 m wall approach.
-     2) Rotate and find cabinet:
+         before retrying the wall approach.
+     2) Determine cabinet side then follow wall:
        - Run `scan_360_mvp(frame_count=20)` and identify cabinet visually (`describe_scan_image(...)`).
-       - When the cabinet is beside the wall, side-wall LiDAR may still look like a frontal obstacle.
-         Do not treat that as a cabinet stop condition while the cabinet is still visible and centered.
-       - If the cabinet is visible in camera, keep moving toward the cabinet even if LiDAR reports the wall nearby.
+       - Determine if cabinet is on left or right side of wall travel corridor, then follow wall using
+         `follow_wall_lidar(side="left"|"right", target_wall_distance_m=0.25, front_stop_distance_m=0.20)`.
+       - When the cabinet is beside the wall, side-wall LiDAR may look like frontal clutter (`side_wall_risk`).
+         Do not treat side-wall risk alone as a cabinet stop condition while cabinet remains visible.
+       - Keep cabinet side consistent across frames; if side flips, pause and re-scan.
        - Turn to cabinet heading with `turn_to_heading(target_heading_deg=H_cabinet)`.
      3) Approach cabinet to 0.20-0.30 m:
        - Use short forward moves with `check_path_clear(...)` and `drive_until_lidar_stop(...)`.
        - Final stop band is 0.20-0.30 m from cabinet.
-       - If LiDAR returns a near obstacle because the wall is still on the side, prefer the cabinet's visual bearing over the wall reading.
+       - If LiDAR returns a near obstacle because the wall is still on the side, prefer cabinet visual bearing
+         and continue only while cabinet remains visible in the same side sector.
        - Do not declare success from LiDAR alone if cabinet is off-center; cabinet must remain centered in camera.
 
     Ordered rule for "patrol between the two lab chairs" tasks (strict)

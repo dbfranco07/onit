@@ -140,18 +140,20 @@ class TestRoboticsPromptTemplate:
         assert "Wall-first is mandatory." in template
         assert "Do NOT scan for cabinet, turn to cabinet heading," in template
         assert "or approach cabinet before wall setup is complete." in template
-        assert "acceptable band 0.18-0.22 m" in template
+        assert "front lidar is in 0.20-0.30 m band" in template
         assert "Find nearest wall and approach it" in template
-        assert "drive_until_lidar_stop(stop_distance_m=0.20" in template
-        assert "Stop when front lidar is about 0.20 m from the wall" in template
+        assert "nearest_wall.relative_heading_deg" in template
+        assert "drive_until_lidar_stop(stop_distance_m=0.25" in template
+        assert "Stop when front lidar is in 0.20-0.30 m band from the wall" in template
         assert "Too-near recovery (required)" in template
         assert "turn(angle=180)" in template
         assert "move_forward(distance=0.30)" in template
-        assert "Rotate and find cabinet" in template
+        assert "Determine cabinet side then follow wall" in template
+        assert "follow_wall_lidar(side=\"left\"|\"right\"" in template
+        assert "Keep cabinet side consistent across frames" in template
         assert "turn_to_heading(target_heading_deg=H_cabinet)" in template
         assert "Approach cabinet to 0.20-0.30 m" in template
         assert "Final stop band is 0.20-0.30 m from cabinet." in template
-        assert "follow_wall_lidar" not in template
 
     def test_patrol_between_lab_chairs_rule_exists(self):
         template_path = (
